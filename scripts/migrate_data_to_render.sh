@@ -4,18 +4,22 @@
 # kaspi-db (данные Kaspi не затрагиваются) — работает только со схемой
 # torgstore, которая уже создана миграциями сайта.
 #
+# Миграции сами сеют несколько reference-строк (managers: «Весь отдел»,
+# settings, source_groups) — они уже есть и локально, и на Render. Для этих
+# трёх таблиц используется INSERT ... ON CONFLICT DO NOTHING (совпадающие
+# строки просто пропускаются, новые — вставляются). Все остальные таблицы
+# переносятся быстрым bulk COPY.
+#
 # Использование:
 #   RENDER_EXTERNAL_DB_URL="postgresql://kaspi_analytics_user:...@dpg-....render.com/kaspi_analytics" \
 #     ./migrate_data_to_render.sh
 #
 # Где взять RENDER_EXTERNAL_DB_URL:
-#   Render Dashboard → kaspi-db → кнопка "Connect" (справа сверху) →
-#   вкладка "External" → "External Database URL" → иконка копирования.
+#   Render Dashboard → kaspi-db → кнопка "Connect" → вкладка "External" →
+#   "External Database URL" → иконка копирования.
 #
-# Скрипт запускает pg_dump/psql ВНУТРИ уже работающего локального контейнера
-# db (не требует psql/pg_dump на самом Mac) и сам переносит данные из схемы
-# public (локально) в схему torgstore (на Render) — без хардкода списка
-# таблиц, всё, что есть в public, кроме служебной schema_migrations.
+# ⚠️ Переменная окружения живёт только в рамках ОДНОЙ команды. Если открыл
+# новый терминал/новую команду — впиши RENDER_EXTERNAL_DB_URL заново.
 
 set -euo pipefail
 
@@ -30,8 +34,13 @@ if [ -z "$CONTAINER" ]; then
 fi
 echo "✓ Локальный контейнер: $CONTAINER"
 
-# Список таблиц берём из локальной базы динамически — не хардкодим.
-TABLES=$(docker exec "$CONTAINER" psql -U postgres -d torgstore -t -A -c \
+# Таблицы, где на Render уже могут быть сид-строки от миграций —
+# переносим через ON CONFLICT DO NOTHING, а не bulk COPY.
+SPECIAL_TABLES="managers settings source_groups"
+
+# Полный список локальных таблиц (кроме служебной schema_migrations) —
+# берём динамически, не хардкодим.
+ALL_TABLES=$(docker exec "$CONTAINER" psql -U postgres -d torgstore -t -A -c \
   "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename <> 'schema_migrations' ORDER BY tablename;")
 
 count_remote_table () {
@@ -44,43 +53,47 @@ count_local_table () {
 }
 
 echo
-echo "→ Проверяю, что схема torgstore на Render сейчас пустая (защита от повторного запуска)..."
-REMOTE_TOTAL=0
-for t in $TABLES; do
-  c=$(count_remote_table "$t" || echo 0)
-  REMOTE_TOTAL=$((REMOTE_TOTAL + ${c:-0}))
+echo "→ Текущее состояние схемы torgstore на Render (для справки):"
+for t in $ALL_TABLES; do
+  r=$(count_remote_table "$t" || echo "?")
+  [ "$r" != "0" ] && printf "  %-28s %s\n" "$t" "$r"
 done
-if [ "$REMOTE_TOTAL" != "0" ] && [ -z "${FORCE:-}" ]; then
-  echo "❌ В схеме torgstore на Render уже есть строки (всего $REMOTE_TOTAL). Похоже, перенос уже делался."
-  echo "   Если точно нужно перезалить поверх — запусти с FORCE=1."
-  exit 1
-fi
-echo "✓ Схема torgstore пустая, можно переносить."
 
 DUMP_FILE="/tmp/torgstore_data_$(date +%s).sql"
+: > "$DUMP_FILE"
 
 echo
-echo "→ 1/3 Дамп данных из локальной базы (схема public, только данные, без schema_migrations)..."
-docker exec "$CONTAINER" pg_dump \
-  -U postgres -d torgstore \
-  --data-only --no-owner \
-  --exclude-table=public.schema_migrations \
-  -n public \
-  > "$DUMP_FILE"
+echo "→ 1/4 Дамп reference-таблиц ($SPECIAL_TABLES) — INSERT с ON CONFLICT DO NOTHING..."
+SPECIAL_ARGS=""
+for t in $SPECIAL_TABLES; do SPECIAL_ARGS="$SPECIAL_ARGS -t public.$t"; done
+# shellcheck disable=SC2086
+docker exec "$CONTAINER" pg_dump -U postgres -d torgstore \
+  --data-only --no-owner --inserts --on-conflict-do-nothing \
+  $SPECIAL_ARGS >> "$DUMP_FILE"
 
-echo "→ 2/3 Перенаправляю целевую схему public → torgstore (только структурные строки, не данные)..."
+echo "→ 2/4 Дамп остальных таблиц — bulk COPY (быстро, без reference-таблиц)..."
+EXCLUDE_ARGS="--exclude-table=public.schema_migrations"
+for t in $SPECIAL_TABLES; do EXCLUDE_ARGS="$EXCLUDE_ARGS --exclude-table=public.$t"; done
+# shellcheck disable=SC2086
+docker exec "$CONTAINER" pg_dump -U postgres -d torgstore \
+  --data-only --no-owner \
+  $EXCLUDE_ARGS -n public >> "$DUMP_FILE"
+
+echo "→ 3/4 Перенаправляю целевую схему public → torgstore (только структурные строки, не данные)..."
 sed -i.bak \
   -e '/^COPY public\./ s/^COPY public\./COPY torgstore./' \
+  -e '/^INSERT INTO public\./ s/^INSERT INTO public\./INSERT INTO torgstore./' \
   -e "/^SELECT pg_catalog\.setval/ s/'public\./'torgstore./" \
   -e '/^ALTER TABLE public\./ s/^ALTER TABLE public\./ALTER TABLE torgstore./' \
   "$DUMP_FILE"
 rm -f "${DUMP_FILE}.bak"
 
-N_TABLES=$(grep -c '^COPY torgstore\.' "$DUMP_FILE" || true)
-echo "  Таблиц с данными для переноса: $N_TABLES"
+N_COPY=$(grep -c '^COPY torgstore\.' "$DUMP_FILE" || true)
+N_INSERT=$(grep -c '^INSERT INTO torgstore\.' "$DUMP_FILE" || true)
+echo "  Таблиц через COPY: $N_COPY, строк через INSERT (reference): $N_INSERT"
 
 echo
-echo "→ 3/3 Заливаю в Render (kaspi-db, схема torgstore), одной транзакцией..."
+echo "→ 4/4 Заливаю в Render (kaspi-db, схема torgstore), одной транзакцией..."
 {
   echo "SET CONSTRAINTS ALL DEFERRED;"
   cat "$DUMP_FILE"
@@ -89,17 +102,19 @@ echo "→ 3/3 Заливаю в Render (kaspi-db, схема torgstore), одн�
 echo
 echo "→ Проверка: строк локально (public) vs на Render (torgstore)"
 MISMATCH=0
-for t in $TABLES; do
+for t in $ALL_TABLES; do
   l=$(count_local_table "$t")
   r=$(count_remote_table "$t" || echo "?")
   mark="✓"
+  # для reference-таблиц Render может законно иметь ТУ ЖЕ или бОльшую логику
+  # ON CONFLICT SKIP не меняет итог, если строки совпали 1-в-1 — числа должны сойтись
   if [ "$l" != "$r" ]; then mark="⚠️"; MISMATCH=1; fi
   printf "  %s %-28s локально=%-8s render=%-8s\n" "$mark" "$t" "$l" "$r"
 done
 
 echo
 if [ "$MISMATCH" = "1" ]; then
-  echo "⚠️  Есть расхождения по строкам — посмотри таблицы с ⚠️ выше."
+  echo "⚠️  Есть расхождения по строкам — посмотри таблицы с ⚠️ выше (для reference-таблиц это может быть ожидаемо, если на Render уже были свои строки)."
 else
   echo "✅ Все таблицы совпадают. Перенос успешен."
 fi
