@@ -1,0 +1,34 @@
+# Render Blueprint — TorgStore Analytics
+# Dashboard → New → Blueprint → выбрать этот репозиторий → Render сам
+# прочитает этот файл и предложит создать web service + Postgres.
+# После создания Render попросит заполнить переменные с sync: false вручную —
+# это специально: секреты не должны лежать в git.
+
+databases:
+  - name: torgstore-db
+    plan: free
+    databaseName: torgstore
+    user: torgstore
+
+services:
+  - type: web
+    name: torgstore-analytics
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: torgstore-db
+          property: connectionString
+      - key: SECRET_KEY
+        generateValue: true
+      - key: BASIC_AUTH_USER
+        sync: false
+      - key: BASIC_AUTH_PASSWORD
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
