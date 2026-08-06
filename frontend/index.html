@@ -6001,8 +6001,8 @@ function renderMgrDeclineReasons(mgrId, period){
         <span class="badge bw">нет данных</span></div>
       <p style="font-size:12px;color:var(--muted);line-height:1.6;margin-top:4px">
         Нет собранной выборки причин отказа за «${period==='all'?'все периоды':period}»${isDept?'':' у '+mgrName}.
-        Причина отказа — поле CRM (лиды «Не реализовано», воронка «Розница Алматы»), которое
-        не агрегируется нигде в built-in отчётах CRM — собирается вручную выборкой по лидам.
+        Причина отказа — поле CRM (лиды «Не реализовано»), которое не агрегируется нигде
+        в built-in отчётах CRM — собирается вручную выборкой по лидам.
       </p>`;
     return;
   }
@@ -6042,13 +6042,18 @@ function renderMgrDeclineReasons(mgrId, period){
       (поле обязательное в CRM, но не заполнено при закрытии сделки).
     </p>` : '';
 
+  // Реальный список воронок в текущей выборке — не хардкод, т.к. с августа 2026
+  // причины собираются и из «Отдел первичных продаж», не только «Розница Алматы».
+  const pipelinesInScope = [...new Set(rows.map(r=>r.pipeline).filter(Boolean))];
+  const pipelinesLabel = pipelinesInScope.length ? pipelinesInScope.map(p=>`«${p}»`).join(' + ') : 'воронка не определена';
+
   card.innerHTML = `
     <div class="card-head">
       <div class="card-title">🚫 Причины отказа</div>
       <span class="badge bd" title="Выборка последних отказов, не исчерпывающий список">выборка · N=${sampleSizeTotal}</span>
     </div>
     <p style="font-size:12px;color:var(--muted);line-height:1.6;margin:2px 0 10px">
-      Причина отказа по лидам «Не реализовано» (воронка «Розница Алматы»). Заполненность поля
+      Причина отказа по лидам «Не реализовано» (${pipelinesLabel}). Заполненность поля
       в выборке: <b style="color:var(--ink)">${fillRate.toFixed(0)}%</b>.
     </p>
     ${barsHtml}
