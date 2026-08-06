@@ -5973,6 +5973,15 @@ function renderMgrInvoices(mgrId, period, advRevenue){
   `;
 }
 
+// «Пусто» в причине отказа записывалось РАЗНЫМИ литералами в разных импортах
+// (июль/Розница Алматы: "(пусто/не указано)", август/Отдел первичных продаж:
+// "(не указано)") — из-за этого точное сравнение строк недосчитывало часть
+// пустых причин и показывало их как настоящую причину «(не указано)» в топе.
+// Единая проверка по паттерну переживает и старые, и будущие варианты строки.
+function isEmptyDeclineReason(reason){
+  return !reason || /^\(.*(пуст|не указан).*\)$/i.test(String(reason).trim());
+}
+
 // Причины отказа (CRM custom field «Причина отказа», лиды «Не реализовано») —
 // ВЫБОРКА (~20-30 последних отказов на менеджера за период), НЕ исчерпывающий
 // список. sample_size показывает размер среза, чтобы доля каждой причины
@@ -6009,9 +6018,10 @@ function renderMgrDeclineReasons(mgrId, period){
     const key = r.manager_id+'|'+r.period+'|'+r.pipeline;
     if(!sampleKeys.has(key)){ sampleKeys.add(key); sampleSizeTotal += Number(r.sample_size||0); }
   }
-  const emptyCount = reasonTotals['(пусто/не указано)'] || 0;
+  const emptyCount = Object.keys(reasonTotals).filter(isEmptyDeclineReason)
+    .reduce((s,r)=>s+reasonTotals[r], 0);
   const fillRate = sampleSizeTotal>0 ? (1 - emptyCount/sampleSizeTotal)*100 : 0;
-  const sortedReasons = Object.keys(reasonTotals).filter(r=>r!=='(пусто/не указано)')
+  const sortedReasons = Object.keys(reasonTotals).filter(r=>!isEmptyDeclineReason(r))
     .sort((a,b)=>reasonTotals[b]-reasonTotals[a]);
   const maxV = Math.max(...sortedReasons.map(r=>reasonTotals[r]), 0.001);
 
@@ -8698,8 +8708,9 @@ function tcDeclineReasonsSummary(managerId, periodOrPeriods){
     const key = r.pipeline;
     if(!seen.has(key)){ seen.add(key); sampleSize += Number(r.sample_size||0); }
   }
-  const emptyCount = totals['(пусто/не указано)'] || 0;
-  const top = Object.keys(totals).filter(r=>r!=='(пусто/не указано)')
+  const emptyCount = Object.keys(totals).filter(isEmptyDeclineReason)
+    .reduce((s,r)=>s+totals[r], 0);
+  const top = Object.keys(totals).filter(r=>!isEmptyDeclineReason(r))
     .sort((a,b)=>totals[b]-totals[a]).slice(0,3)
     .map(reason=>({reason, count: totals[reason]}));
   return {top, sampleSize, emptyCount, fillRate: sampleSize>0 ? (1-emptyCount/sampleSize)*100 : 0};
