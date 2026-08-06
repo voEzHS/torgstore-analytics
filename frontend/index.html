@@ -3789,12 +3789,33 @@ async function editProductField(targetType, targetId, field, currentValue, mgrId
 async function renderProductBlock(mgrId, period, containerId){
   const el = document.getElementById(containerId);
   if(!el) return;
-  el.dataset.prodKey = mgrId + '::' + period;
   el.innerHTML = '<div style="font-size:12px;color:var(--muted)">Загрузка товарной аналитики…</div>';
-  const p = await fetchManagerProducts(mgrId, period);
+  const resolved = await resolveManagerProductPeriod(mgrId, period);
   const el2 = document.getElementById(containerId);  // карточка могла перерисоваться, пока грузили
   if(!el2) return;
-  el2.innerHTML = productBlockInnerHtml(p, mgrId, period);
+  // Ключ кэша — по РЕАЛЬНО показанному периоду (resolved.period), а не запрошенному:
+  // иначе точечная правка (editProductField) после фолбэка не найдёт этот контейнер
+  // при инвалидации кэша (см. querySelectorAll('[data-prod-key=...]') ниже).
+  el2.dataset.prodKey = mgrId + '::' + resolved.period;
+  const fallbackNote = resolved.isFallback
+    ? `<div style="font-size:11px;color:var(--amber);margin-bottom:10px;padding:7px 10px;background:var(--bg);border-radius:6px;border-left:3px solid var(--amber)">⚠ За «${period}» товарные данные ещё не загружены — показаны последние доступные (${resolved.period}).</div>`
+    : '';
+  el2.innerHTML = fallbackNote + productBlockInnerHtml(resolved.data, mgrId, resolved.period);
+}
+
+// Ищет назад по MONTHS ближайший период, за который для менеджера ЕСТЬ товарные
+// данные — если за preferredPeriod (обычно d.period досье) их ещё нет. Возвращает
+// isFallback:true, когда показанные данные не за тот период, что был запрошен —
+// это обязано быть видно пользователю (см. renderProductBlock), а не молчать.
+async function resolveManagerProductPeriod(mgrId, preferredPeriod){
+  const p0 = await fetchManagerProducts(mgrId, preferredPeriod);
+  if(p0) return {period: preferredPeriod, data: p0, isFallback: false};
+  const idx = MONTHS.indexOf(preferredPeriod);
+  for(let i = idx - 1; i >= 0; i--){
+    const p = await fetchManagerProducts(mgrId, MONTHS[i]);
+    if(p) return {period: MONTHS[i], data: p, isFallback: true};
+  }
+  return {period: preferredPeriod, data: null, isFallback: false};
 }
 
 function currentPeriodForMgr(mgrId){
@@ -8618,7 +8639,8 @@ function tcDossierTemplate(d, managerId, teamAvg){
     ? (k.conv>=k.convTeamAvg?'pos':'neg') : '';
   const inv = tcInvoiceSummary(managerId, d.period);
   const loss = tcLeadLoss(managerId, d.period);
-  const decline = tcDeclineReasonsSummary(managerId, d.period);
+  const declinePeriods = [...new Set((declineReasons||[]).filter(r=>r.manager_id===managerId).map(r=>r.period))];
+  const decline = tcDeclineReasonsSummary(managerId, declinePeriods.length ? declinePeriods : d.period);
   const leadCostsConfigured = !!(cfg.leadCosts && Object.keys(cfg.leadCosts).length);
   const teamN = teamAvg ? teamAvg.n - 1 : 0;
   // Причинный анализ (ожидаемая конверсия по миксу каналов, риск ₸) и экономика
@@ -8726,7 +8748,7 @@ function tcDossierTemplate(d, managerId, teamAvg){
     </div>
     <div class="tc-panel" id="tc-d-products-${managerId}" style="margin-bottom:16px"><div style="font-size:12px;color:var(--muted)">Загрузка товарной аналитики…</div></div>
     <div class="tc-panel" style="margin-bottom:16px">
-      <div class="tc-panel-title">Причины отказа <span style="font-weight:400;color:var(--muted);font-size:11px">${decline ? '(выборка, N='+decline.sampleSize+')' : ''}</span></div>
+      <div class="tc-panel-title">Причины отказа <span style="font-weight:400;color:var(--muted);font-size:11px">${decline ? '(выборка, N='+decline.sampleSize+(declinePeriods.length>1?', за '+declinePeriods.length+' период(а/ов)':'')+')' : ''}</span></div>
       ${decline ? `
         ${decline.top.map(t=>`
           <div style="display:flex;justify-content:space-between;font-size:12.5px;padding:3px 0">
