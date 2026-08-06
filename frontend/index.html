@@ -6510,6 +6510,51 @@ function computeDeptMgrAnalysis(period){
   const deptAvgCheck=mgrData.length?mgrData.reduce((s,m)=>s+(m.avgCheck||0),0)/mgrData.length:0;
   const medals=['🥇','🥈','🥉'];
 
+  // ── ПРИЧИННЫЙ АНАЛИЗ: ожидаемая конверсия по миксу каналов, материальность (₸), скос лидов ──
+  const deptConvBySrc={};
+  mgrData.forEach(m=>Object.entries(m.srcMap).forEach(([src,v])=>{
+    if(!deptConvBySrc[src])deptConvBySrc[src]={leads:0,deals:0};
+    deptConvBySrc[src].leads+=v.leads; deptConvBySrc[src].deals+=v.deals;
+  }));
+  const expectedShare=mgrData.length?100/mgrData.length:0;
+  const mgrAnalysis={};
+  mgrData.forEach(m=>{
+    let expLeads=0,expDeals=0;
+    Object.entries(m.srcMap).forEach(([src,v])=>{
+      const d=deptConvBySrc[src];
+      if(d&&d.leads>0){const srcConv=d.deals/d.leads;expDeals+=v.leads*srcConv;expLeads+=v.leads;}
+    });
+    const expectedConv=expLeads?expDeals/expLeads*100:null;
+    const convVsExpected=(expectedConv!==null&&m.conv!==null&&m.conv<=100)?m.conv-expectedConv:null;
+    const gapDeals=(avgConv&&m.conv!==null&&m.conv<=100&&m.conv<avgConv)?(avgConv-m.conv)/100*m.leads:0;
+    const gapRevenue=gapDeals*(m.avgCheck||deptAvgCheck||0);
+    const leadShare=totalLeadsAll?m.leads/totalLeadsAll*100:0;
+    const leadSkewPct=expectedShare?(leadShare-expectedShare)/expectedShare*100:0;
+    mgrAnalysis[m.id]={expectedConv,convVsExpected,gapDeals,gapRevenue,leadShare,leadSkewPct};
+  });
+  const convStd=stddevArr(byConv.map(m=>m.conv));
+  return {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor};
+}
+
+function renderCompare(){
+  if(cmpMode==='per'){renderPeriodCompare();return;}
+  document.getElementById('cmp-period-content').classList.add('hidden');
+  const period=document.getElementById('cmp-period').value;
+  const mgrS=sessions.filter(s=>s.mgrId!==null&&(period==='all'||s.period===period));
+  const mgrIds=[...new Set(mgrS.map(s=>s.mgrId))];
+  if(!mgrIds.length){
+    document.getElementById('cmp-empty').classList.remove('hidden');
+    document.getElementById('cmp-content').classList.add('hidden');
+    document.getElementById('cmp-empty-text').textContent='Загрузи данные по менеджерам';
+    return;
+  }
+  document.getElementById('cmp-empty').classList.add('hidden');
+  document.getElementById('cmp-content').classList.remove('hidden');
+
+  // Собираем данные
+  const _dma = computeDeptMgrAnalysis(period);
+  const {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor} = _dma;
+
   // ── ОБЩАЯ СУММА ПРОДАЖ ПО ОТДЕЛУ: сначала итог, потом разбивка на рекламу/остальное ──
   const invMgrs=mgrData.filter(m=>m.hasInvoice);
   // totalInvoiceRev — раньше это была сумма invoiceRevenue ТОЛЬКО по mgrData (менеджерам, у
@@ -6575,51 +6620,6 @@ function computeDeptMgrAnalysis(period){
     <div class="card-head" style="margin-bottom:4px"><div class="card-title">⚠ Накладных за период нет</div></div>
     <div style="font-size:12px;color:var(--muted)">Ни у одного менеджера нет среза по накладным за выбранный период — рейтинг и таблица ниже показывают только рекламную выручку.</div>
   </div>`;
-
-  // ── ПРИЧИННЫЙ АНАЛИЗ: ожидаемая конверсия по миксу каналов, материальность (₸), скос лидов ──
-  const deptConvBySrc={};
-  mgrData.forEach(m=>Object.entries(m.srcMap).forEach(([src,v])=>{
-    if(!deptConvBySrc[src])deptConvBySrc[src]={leads:0,deals:0};
-    deptConvBySrc[src].leads+=v.leads; deptConvBySrc[src].deals+=v.deals;
-  }));
-  const expectedShare=mgrData.length?100/mgrData.length:0;
-  const mgrAnalysis={};
-  mgrData.forEach(m=>{
-    let expLeads=0,expDeals=0;
-    Object.entries(m.srcMap).forEach(([src,v])=>{
-      const d=deptConvBySrc[src];
-      if(d&&d.leads>0){const srcConv=d.deals/d.leads;expDeals+=v.leads*srcConv;expLeads+=v.leads;}
-    });
-    const expectedConv=expLeads?expDeals/expLeads*100:null;
-    const convVsExpected=(expectedConv!==null&&m.conv!==null&&m.conv<=100)?m.conv-expectedConv:null;
-    const gapDeals=(avgConv&&m.conv!==null&&m.conv<=100&&m.conv<avgConv)?(avgConv-m.conv)/100*m.leads:0;
-    const gapRevenue=gapDeals*(m.avgCheck||deptAvgCheck||0);
-    const leadShare=totalLeadsAll?m.leads/totalLeadsAll*100:0;
-    const leadSkewPct=expectedShare?(leadShare-expectedShare)/expectedShare*100:0;
-    mgrAnalysis[m.id]={expectedConv,convVsExpected,gapDeals,gapRevenue,leadShare,leadSkewPct};
-  });
-  const convStd=stddevArr(byConv.map(m=>m.conv));
-  return {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor};
-}
-
-function renderCompare(){
-  if(cmpMode==='per'){renderPeriodCompare();return;}
-  document.getElementById('cmp-period-content').classList.add('hidden');
-  const period=document.getElementById('cmp-period').value;
-  const mgrS=sessions.filter(s=>s.mgrId!==null&&(period==='all'||s.period===period));
-  const mgrIds=[...new Set(mgrS.map(s=>s.mgrId))];
-  if(!mgrIds.length){
-    document.getElementById('cmp-empty').classList.remove('hidden');
-    document.getElementById('cmp-content').classList.add('hidden');
-    document.getElementById('cmp-empty-text').textContent='Загрузи данные по менеджерам';
-    return;
-  }
-  document.getElementById('cmp-empty').classList.add('hidden');
-  document.getElementById('cmp-content').classList.remove('hidden');
-
-  // Собираем данные
-  const _dma = computeDeptMgrAnalysis(period);
-  const {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor} = _dma;
 
   // ── СВОДНЫЙ РЕЙТИНГ (заменяет 4 разрозненные карточки-лидерборда) ──────
   const compositeScores={};
