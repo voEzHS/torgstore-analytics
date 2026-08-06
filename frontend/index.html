@@ -6517,6 +6517,16 @@ function buildMgrProfileHtml(m, byRev, avgConv, mgrAnalysis, deptAvgCheck){
     })():''}
     <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin:6px 0">Все источники менеджера</div>
     <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Источник</th><th class="r">Лидов</th><th class="r">Продаж</th><th class="r">Конверсия</th><th class="r">Выручка</th><th class="r">Ср.чек</th><th class="r">Слито</th></tr></thead><tbody>${srcTableRows}</tbody></table></div>
+    ${(()=>{
+      const decline=tcDeclineReasonsSummary(m.id, deptPeriods);
+      return `<div style="background:var(--card);border-radius:8px;padding:10px;margin-top:10px">
+        <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px">Причины отказа ${decline?'(выборка, N='+decline.sampleSize+')':''}</div>
+        ${decline?`
+          ${decline.top.map(t=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0"><span>${t.reason}</span><b>${t.count}</b></div>`).join('')}
+          <div style="font-size:10px;color:var(--muted);margin-top:4px">заполненность поля: ${decline.fillRate.toFixed(0)}%${decline.emptyCount>0?` (${decline.emptyCount} без причины)`:''}</div>
+        `:`<div style="font-size:11px;color:var(--muted)">Выборка причин отказа за этот период не собрана.</div>`}
+      </div>`;
+    })()}
     <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px" id="mgr-products-${m.id}"><div style="font-size:12px;color:var(--muted)">Загрузка товарной аналитики…</div></div>
   </div>`;
 }
@@ -8673,8 +8683,12 @@ function tcLeadLoss(managerId, period){
 
 // Причины отказа менеджера за период — ВЫБОРКА (см. renderMgrDeclineReasons),
 // не исчерпывающий список. Топ-3 причины + заполненность поля для досье.
-function tcDeclineReasonsSummary(managerId, period){
-  const rows = (declineReasons||[]).filter(r => r.manager_id===managerId && r.period===period);
+// periodOrPeriods принимает либо один период (строка), либо массив периодов —
+// второе нужно карточке менеджера в Сравнении, где при «Все периоды» m.period
+// это уже склеенная строка "Июнь 2026 + Июль 2026 + ...", а не значение из БД.
+function tcDeclineReasonsSummary(managerId, periodOrPeriods){
+  const periods = Array.isArray(periodOrPeriods) ? periodOrPeriods : [periodOrPeriods];
+  const rows = (declineReasons||[]).filter(r => r.manager_id===managerId && periods.includes(r.period));
   if(!rows.length) return null;
   const totals = {};
   let sampleSize = 0;
