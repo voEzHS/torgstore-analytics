@@ -8587,7 +8587,10 @@ function tcDeclineReasonsSummary(managerId, periodOrPeriods){
   const seen = new Set();
   for(const r of rows){
     totals[r.reason] = (totals[r.reason]||0) + Number(r.count||0);
-    const key = r.pipeline;
+    // Составной ключ (не только pipeline) — см. комментарий у renderMgrDeclineReasons:
+    // при агрегации нескольких периодов один и тот же pipeline мог бы повториться и
+    // молча потерять sample_size одного из периодов при дедупе только по pipeline.
+    const key = managerId+'|'+r.period+'|'+r.pipeline;
     if(!seen.has(key)){ seen.add(key); sampleSize += Number(r.sample_size||0); }
   }
   const emptyCount = Object.keys(totals).filter(isEmptyDeclineReason)
