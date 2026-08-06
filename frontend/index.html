@@ -3210,9 +3210,9 @@ const apiDel  = (path)        => api('DELETE', path);
 // ── NAV ──────────────────────────────────────────────────────────
 const PAGES = ['today','compare','teamcenter','ask','upload','team','settings'];
 function nav(p){
-  // Закрываем модалку карточки менеджера при уходе со страницы Сравнения —
-  // иначе она могла бы зависнуть открытой поверх другой вкладки.
-  if(typeof closeMgrModal === 'function') closeMgrModal();
+  // Закрываем досье менеджера при уходе со страницы — иначе оно могло бы
+  // зависнуть открытым поверх другой вкладки (единое досье, см. openTcDossier).
+  if(typeof closeTcDossier === 'function') closeTcDossier();
   // Обзор/Источники/Менеджер/Прогноз (ASK_SUBS) — не элементы PAGES, ими
   // управляет только askShow()/askBack(). Раньше они всегда были обёрнуты
   // входом через nav('ask'), поэтому PAGES.forEach ниже их никогда не видел.
@@ -6331,52 +6331,20 @@ function stddevArr(arr){
   const avg = arr.reduce((s,v)=>s+v,0)/arr.length;
   return Math.sqrt(arr.reduce((s,v)=>s+(v-avg)**2,0)/arr.length);
 }
-// ── Drill-down: карточка менеджера в «Сравнении» открывается в модалке ──
-// Раньше клик по менеджеру разворачивал карточку ПРЯМО В СЕТКЕ (с полным
-// перерендером всей страницы Сравнения и scrollIntoView) — из-за этого страница
-// дёргалась, терялась позиция скролла в таблице/тепловой карте, а закрыть
-// карточку можно было только найдя её обратно после скролла. Модалка поверх
-// текущего экрана не трогает уже отрисованную страницу и не требует перерендера:
-// _cmpLastState хранит последние вычисленные данные Сравнения (обновляется в
-// конце renderCompare), а открытие модалки просто читает из него нужного
-// менеджера и строит карточку на лету.
-let _cmpLastState = null;
-function openMgrModal(id){
-  if(!_cmpLastState) return;
-  const {mgrData, byRev, avgConv, mgrAnalysis, deptAvgCheck} = _cmpLastState;
-  const m = mgrData.find(x=>x.id===id);
-  if(!m) return;
-
-  closeMgrModal();
-  const modal=document.createElement('div');
-  modal.id='mgr-drill-modal';
-  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:1000;display:flex;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto';
-
-  const box=document.createElement('div');
-  box.style.cssText='background:var(--surface);border-radius:14px;padding:22px;width:920px;max-width:100%;box-shadow:0 24px 70px rgba(0,0,0,.35);--card-accent:'+m.color;
-  box.innerHTML=
-    '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px">'+
-      '<div><div style="font-size:16px;font-weight:800">🔎 '+m.name+'</div><div style="font-size:12px;color:var(--muted);margin-top:2px">'+m.period+'</div></div>'+
-      '<button id="mgr-modal-close-btn" class="btn btn-ghost" style="padding:4px 12px;font-size:12px;flex-shrink:0">✕ Закрыть</button>'+
-    '</div>'+
-    '<div id="mgr-modal-body"></div>';
-  modal.appendChild(box);
-  document.body.appendChild(modal);
-
-  document.getElementById('mgr-modal-body').innerHTML=buildMgrProfileHtml(m,byRev,avgConv,mgrAnalysis,deptAvgCheck);
-  box.querySelector('#mgr-modal-close-btn').addEventListener('click', closeMgrModal);
-  modal.addEventListener('click', e=>{ if(e.target===modal) closeMgrModal(); });
-  document.addEventListener('keydown', _mgrModalEscHandler);
-
-  const prodPeriod=currentPeriodForMgr(id);
-  if(prodPeriod) renderProductBlock(id, prodPeriod, 'mgr-products-'+id);
+// «Все периоды» в Сравнении → m.periods (массив, отсортирован по хронологии),
+// а единое досье (openTcDossier) принимает ровно один period. Берём самый свежий —
+// единственное место, где выбор «Все периоды» теряет детализацию при открытии
+// досье; принято сознательно 06.08.2026 при объединении карточки Сравнения и
+// досье Командного центра в одну реализацию (см. computeDeptMgrAnalysis выше).
+function mgrDossierPeriod(m){
+  return (m.periods && m.periods.length) ? m.periods[m.periods.length-1] : m.period;
 }
-function closeMgrModal(){
-  const modal=document.getElementById('mgr-drill-modal');
-  if(modal) modal.remove();
-  document.removeEventListener('keydown', _mgrModalEscHandler);
-}
-function _mgrModalEscHandler(e){ if(e.key==='Escape') closeMgrModal(); }
+
+// ── Drill-down: карточка менеджера в «Сравнении» открывает ЕДИНОЕ досье ──
+// (то же самое, что и в Командном центре — openTcDossier/tcDossierTemplate).
+// Раньше здесь была отдельная модалка (openMgrModal/buildMgrProfileHtml) с
+// частично другой логикой — из-за двух копий одного и того же концептуально
+// UI родились расхождения (аудит 06.08.2026) — теперь одна точка входа.
 
 // ── Сводный балл менеджера: 40% выручка (percentile) + 40% конверсия (percentile) + 20% отсутствие риска ──
 function computeCompositeScore(m, mgrData, mgrAnalysis){
@@ -6395,22 +6363,6 @@ function computeCompositeScore(m, mgrData, mgrAnalysis){
   const riskPct=(a.gapRevenue>0&&avgAdRevPerMgr)?Math.min(100,a.gapRevenue/avgAdRevPerMgr*100):0;
   const composite=Math.round(0.4*convPct+0.4*revPct+0.2*(100-riskPct));
   return {composite:Math.max(0,Math.min(100,composite)),revPct,convPct,riskPct};
-}
-
-// ── «Объясни мой ранг» — одно предложение с главной причиной места в рейтинге ──
-function explainRank(m, byRev, avgConv, mgrAnalysis){
-  const rank=byRev.findIndex(x=>x.id===m.id)+1;
-  const N=byRev.length;
-  const a=mgrAnalysis[m.id]||{};
-  let reason;
-  if(a.gapRevenue>0 && m.conv!==null && avgConv){
-    reason=`конверсия ниже отдела на ${(avgConv-m.conv).toFixed(1)} п.п. — упущено ≈${fmtM(a.gapRevenue)}`;
-  } else if(m.conv!==null && avgConv && m.conv>=avgConv){
-    reason=`конверсия выше среднего по отделу (${m.conv.toFixed(1)}% против ${avgConv.toFixed(1)}%)`;
-  } else {
-    reason='показатели на уровне отдела, явных отклонений нет';
-  }
-  return `#${rank} из ${N} по общей сумме продаж (${m.hasInvoice?'накладные':'только реклама, накладных нет'}) · ${reason}`;
 }
 
 // ── Текстовая рекомендация по менеджеру: главная точка роста, с приоритетом по значимости ──
@@ -6435,115 +6387,6 @@ function mgrRecommendation(m, a, avgConv, deptAvgCheck){
   if(!issues.length) return 'Показатели на уровне отдела или выше — явных точек роста не выявлено.';
   issues.sort((x,y)=>y.sev-x.sev);
   return issues[0].text;
-}
-
-// ── Полная карточка менеджера (drill-down), рендерится инлайн внутри «Сравнения» ──
-function buildMgrProfileHtml(m, byRev, avgConv, mgrAnalysis, deptAvgCheck){
-  // m.periods — все периоды, вошедшие в тоталы этого менеджера (может быть несколько, если
-  // выбрано «Все периоды»). Сравниваем с отделом за ТЕ ЖЕ периоды, суммируя их так же.
-  const deptPeriods=m.periods&&m.periods.length?m.periods:[m.period];
-  const deptSessions=sessions.filter(s=>s.mgrId===null&&deptPeriods.includes(s.period));
-  const DT=deptSessions.length?aggregateSessionTotals(deptSessions):null;
-  const repRevenue=m.repRevenue||0;
-  const newRevenue=Math.max(0,m.revenue-repRevenue);
-  const repAvgCheck=m.repDeals?repRevenue/m.repDeals:null;
-  const newAvgCheck=m.newDeals?newRevenue/m.newDeals:null;
-  const repRevShare=m.revenue?repRevenue/m.revenue*100:null;
-
-  const shareBlock=DT?(()=>{
-    const lShare=n(DT.leads)?m.leads/n(DT.leads)*100:null;
-    // Доля в выручке отдела — считаем по totalRevenue (та же иерархия, что и колонка «Доля»
-    // в общей таблице Сравнения: накладные-первично, реклама-фолбэк), а не по чистой рекламе,
-    // иначе эта цифра расходится с «Доля» в таблице без объяснения для одного и того же менеджера.
-    const deptTotalRevenue=byRev.reduce((s,x)=>s+(x.totalRevenue||0),0);
-    const rShare=deptTotalRevenue?m.totalRevenue/deptTotalRevenue*100:null;
-    const convDelta=(m.conv!==null&&DT.conv!==null&&m.conv<=100&&DT.conv<=100)?m.conv-n(DT.conv):null;
-    const checkDelta=(m.avgCheck&&n(DT.avgCheck))?m.avgCheck-n(DT.avgCheck):null;
-    return `<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px">
-      <div style="background:var(--card);border-radius:8px;padding:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Доля в лидах отдела</div><b style="font-size:13px">${lShare!==null?lShare.toFixed(1)+'%':'—'}</b></div>
-      <div style="background:var(--card);border-radius:8px;padding:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Доля в общей выручке отдела</div><b style="font-size:13px">${rShare!==null?rShare.toFixed(1)+'%':'—'}</b></div>
-      <div style="background:var(--card);border-radius:8px;padding:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Конверсия vs отдел</div><b style="font-size:13px;color:${convDelta!==null?(convDelta>=0?'var(--green-m)':'var(--red-m)'):'inherit'}">${convDelta!==null?(convDelta>=0?'+':'')+convDelta.toFixed(1)+'%':'—'}</b></div>
-      <div style="background:var(--card);border-radius:8px;padding:8px"><div style="font-size:9px;color:var(--muted);text-transform:uppercase;margin-bottom:2px">Ср. чек vs отдел</div><b style="font-size:13px;color:${checkDelta!==null?(checkDelta>=0?'var(--green-m)':'var(--red-m)'):'inherit'}">${checkDelta!==null?(checkDelta>=0?'+':'')+fmtM(Math.abs(Math.round(checkDelta))):'—'}</b></div>
-    </div>`;
-  })():'<div style="font-size:11px;color:var(--muted);margin-bottom:10px">Нет данных отдела за этот период для сравнения.</div>';
-
-  const repeatBlock=`<div style="background:var(--card);border-radius:8px;padding:10px;margin-bottom:10px">
-    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px">Экономика повторных клиентов</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:11px">
-      <div><span style="color:var(--muted)">Чек новых:</span><br><b>${newAvgCheck!==null?fmtM(newAvgCheck):'—'}</b></div>
-      <div><span style="color:var(--muted)">Чек повторных:</span><br><b>${repAvgCheck!==null?fmtM(repAvgCheck):'—'}</b></div>
-      <div><span style="color:var(--muted)">Доля выручки от базы:</span><br><b>${repRevShare!==null?repRevShare.toFixed(0)+'%':'—'}</b></div>
-    </div>
-  </div>`;
-
-  const a=mgrAnalysis[m.id]||{};
-  const causalBlock=`<div style="background:var(--card);border-radius:8px;padding:10px;margin-bottom:10px">
-    ${a.expectedConv!==null&&a.expectedConv!==undefined?`<div style="font-size:11px;color:var(--muted);margin-bottom:4px">Ожидаемая конверсия по миксу каналов: <b style="color:var(--ink)">${a.expectedConv.toFixed(1)}%</b> · факт ${a.convVsExpected>=0?'выше':'ниже'} на <b style="color:${a.convVsExpected>=0?'var(--green-m)':'var(--red-m)'}">${a.convVsExpected>=0?'+':''}${a.convVsExpected.toFixed(1)}%</b></div>`:''}
-    ${a.gapRevenue>0?`<div style="font-size:11px;color:var(--muted);margin-bottom:4px">Если бы конверсия была на уровне отдела (${avgConv.toFixed(1)}%): <b style="color:var(--red-m)">+${fmtM(a.gapRevenue)}</b> к рекламной выручке</div>`:''}
-    <div style="font-size:11px;color:var(--ink);font-weight:600">💡 ${mgrRecommendation(m,a,avgConv,deptAvgCheck)}</div>
-  </div>`;
-
-  const validRows=(m.rows||[]).filter(r=>r.conv!==null&&r.conv<=100&&n(r.leads)>=2);
-  const bestSrc=[...validRows].sort((a2,b2)=>n(b2.conv)-n(a2.conv))[0];
-  const worstSrc=[...validRows].sort((a2,b2)=>n(a2.conv)-n(b2.conv))[0];
-
-  const srcTableRows=(m.rows||[]).slice().sort((a2,b2)=>n(b2.revenue)-n(a2.revenue)).map(r=>{
-    const sl=n(r.leads)-n(r.deals||0);
-    return `<tr>
-      <td><b>${r.src}</b></td>
-      <td class="r">${fmt(r.leads)}</td>
-      <td class="r">${fmt(r.deals)}</td>
-      <td class="r">${fmtC(r.conv)}</td>
-      <td class="r">${fmtM(r.revenue)}</td>
-      <td class="r">${fmtM(r.avgCheck)}</td>
-      <td class="r" style="color:${sl>0?'var(--red-m)':'inherit'}">${fmt(sl)}</td>
-    </tr>`;
-  }).join('');
-
-  // Явное разделение «сколько всего / сколько именно с рекламы» — раньше в этой карточке
-  // (в отличие от страницы «Менеджер») не было ни общей суммы накладных, ни явного количества
-  // и суммы продаж, пришедших именно с рекламы — только проценты в shareBlock. Пользователь
-  // видел, например, «31 млн общей суммы» в таблице Сравнения и не мог найти на карточке,
-  // сколько из этого реклама (14 сделок / 13 млн) и заодно путал это с товарной аналитикой
-  // (см. блок ниже, отдельный источник по дате доставки — не то же самое).
-  const revenueSplitBlock = m.hasInvoice ? `<div style="background:var(--card);border-radius:8px;padding:10px;margin-bottom:10px;border-left:3px solid var(--navy-m)">
-    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px">Общая сумма продаж (накладные) — откуда пришли</div>
-    <div style="display:flex;flex-wrap:wrap;gap:18px;align-items:baseline">
-      <div><span style="font-size:18px;font-weight:800">${fmtM(m.totalRevenue)}</span><br><span style="font-size:10px;color:var(--muted)">всего чистыми</span></div>
-      <div><span style="font-size:15px;font-weight:700;color:var(--navy-m)">${fmt(m.deals)} продаж · ${fmtM(m.revenue)}</span><br><span style="font-size:10px;color:var(--muted)">с рекламы (CRM)${m.adSharePct!==null?' — '+m.adSharePct.toFixed(0)+'%':''}</span></div>
-      ${m.restRevenue!==null?`<div><span style="font-size:15px;font-weight:700;color:var(--ink)">${fmtM(m.restRevenue)}</span><br><span style="font-size:10px;color:var(--muted)">остальное (не привязано к рекл. сделкам)${m.adSharePct!==null?' — '+(100-m.adSharePct).toFixed(0)+'%':''}</span></div>`:''}
-    </div>
-    ${m.returnsAmount>0?`<div style="font-size:10px;color:var(--red-m);margin-top:6px">− ${fmtM(m.returnsAmount)} возвраты (${fmt(m.returnsCount)} шт) уже вычтены из суммы выше</div>`:''}
-  </div>` : `<div style="background:var(--card);border-radius:8px;padding:10px;margin-bottom:10px;border-left:3px solid var(--navy-m)">
-    <div style="font-size:11px;color:var(--muted)">Накладные за этот период не загружены — показана только рекламная выручка: <b>${fmt(m.deals)} продаж · ${fmtM(m.revenue)}</b></div>
-  </div>`;
-
-  return `<div id="mgr-profile-${m.id}">
-    <div style="font-size:12px;color:var(--ink);font-weight:600;margin-bottom:12px">${explainRank(m,byRev,avgConv,mgrAnalysis)}</div>
-    ${revenueSplitBlock}
-    ${shareBlock}
-    ${repeatBlock}
-    ${causalBlock}
-    ${bestSrc?`<div style="font-size:11px;margin-bottom:6px"><span style="color:var(--green-m);font-weight:700">✅ Лучший источник:</span> ${bestSrc.src} — ${fmtC(bestSrc.conv)}, ${fmtM(bestSrc.revenue)}</div>`:''}
-    ${worstSrc&&(!bestSrc||worstSrc.src!==bestSrc.src)?(()=>{
-      const wsNR=(worstSrc.notRealized!==null&&worstSrc.notRealized!==undefined)?+worstSrc.notRealized:null;
-      const wsTxt=wsNR!==null?`проиграно ${fmt(wsNR)}`:`слито ${fmt(n(worstSrc.leads)-n(worstSrc.deals||0))} (оценка)`;
-      return `<div style="font-size:11px;margin-bottom:10px"><span style="color:var(--red-m);font-weight:700">❌ Худший источник:</span> ${worstSrc.src} — ${fmtC(worstSrc.conv)}, ${wsTxt}</div>`;
-    })():''}
-    <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin:6px 0">Все источники менеджера</div>
-    <div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Источник</th><th class="r">Лидов</th><th class="r">Продаж</th><th class="r">Конверсия</th><th class="r">Выручка</th><th class="r">Ср.чек</th><th class="r">Слито</th></tr></thead><tbody>${srcTableRows}</tbody></table></div>
-    ${(()=>{
-      const decline=tcDeclineReasonsSummary(m.id, deptPeriods);
-      return `<div style="background:var(--card);border-radius:8px;padding:10px;margin-top:10px">
-        <div style="font-size:9px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:6px">Причины отказа ${decline?'(выборка, N='+decline.sampleSize+')':''}</div>
-        ${decline?`
-          ${decline.top.map(t=>`<div style="display:flex;justify-content:space-between;font-size:12px;padding:2px 0"><span>${t.reason}</span><b>${t.count}</b></div>`).join('')}
-          <div style="font-size:10px;color:var(--muted);margin-top:4px">заполненность поля: ${decline.fillRate.toFixed(0)}%${decline.emptyCount>0?` (${decline.emptyCount} без причины)`:''}</div>
-        `:`<div style="font-size:11px;color:var(--muted)">Выборка причин отказа за этот период не собрана.</div>`}
-      </div>`;
-    })()}
-    <div style="border-top:1px solid var(--border);margin-top:12px;padding-top:12px" id="mgr-products-${m.id}"><div style="font-size:12px;color:var(--muted)">Загрузка товарной аналитики…</div></div>
-  </div>`;
 }
 
 // Сводит тоталы нескольких сессий менеджера/отдела в одну (для режима «Все периоды» в
@@ -6575,22 +6418,18 @@ function aggregateSessionTotals(sessList){
   };
 }
 
-function renderCompare(){
-  if(cmpMode==='per'){renderPeriodCompare();return;}
-  document.getElementById('cmp-period-content').classList.add('hidden');
-  const period=document.getElementById('cmp-period').value;
+// Базовые агрегаты по всем менеджерам с рекламной сессией за period + причинный
+// анализ (ожидаемая конверсия по миксу каналов, скос лидов, риск в ₸) — единая
+// точка правды и для «Сравнения», и для единого досье менеджера (Командный центр
+// + drill-down из Сравнения, см. openTcDossier/tcDossierTemplate). Раньше карточка
+// в Сравнении и досье в Командном центре были двумя независимыми реализациями с
+// частично разной логикой — отсюда 3 расхождения, найденные аудитом 06.08.2026
+// (см. isEmptyDeclineReason). Возвращает null, если за period вообще нет ни одной
+// рекламной сессии менеджера (может быть при периоде только с накладными).
+function computeDeptMgrAnalysis(period){
   const mgrS=sessions.filter(s=>s.mgrId!==null&&(period==='all'||s.period===period));
   const mgrIds=[...new Set(mgrS.map(s=>s.mgrId))];
-  if(!mgrIds.length){
-    document.getElementById('cmp-empty').classList.remove('hidden');
-    document.getElementById('cmp-content').classList.add('hidden');
-    document.getElementById('cmp-empty-text').textContent='Загрузи данные по менеджерам';
-    return;
-  }
-  document.getElementById('cmp-empty').classList.add('hidden');
-  document.getElementById('cmp-content').classList.remove('hidden');
-
-  // Собираем данные
+  if(!mgrIds.length) return null;
   const colors=['#2563EB','#059669','#D97706','#DC2626','#7C3AED','#0891B2','#EA580C','#65A30D','#DB2777','#475569'];
   const mgrColor=(idx)=>idx<colors.length?colors[idx]:`hsl(${(idx*47)%360},62%,50%)`;
   const mgrData=mgrIds.map(id=>{
@@ -6760,6 +6599,27 @@ function renderCompare(){
     mgrAnalysis[m.id]={expectedConv,convVsExpected,gapDeals,gapRevenue,leadShare,leadSkewPct};
   });
   const convStd=stddevArr(byConv.map(m=>m.conv));
+  return {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor};
+}
+
+function renderCompare(){
+  if(cmpMode==='per'){renderPeriodCompare();return;}
+  document.getElementById('cmp-period-content').classList.add('hidden');
+  const period=document.getElementById('cmp-period').value;
+  const mgrS=sessions.filter(s=>s.mgrId!==null&&(period==='all'||s.period===period));
+  const mgrIds=[...new Set(mgrS.map(s=>s.mgrId))];
+  if(!mgrIds.length){
+    document.getElementById('cmp-empty').classList.remove('hidden');
+    document.getElementById('cmp-content').classList.add('hidden');
+    document.getElementById('cmp-empty-text').textContent='Загрузи данные по менеджерам';
+    return;
+  }
+  document.getElementById('cmp-empty').classList.add('hidden');
+  document.getElementById('cmp-content').classList.remove('hidden');
+
+  // Собираем данные
+  const _dma = computeDeptMgrAnalysis(period);
+  const {mgrData, byRev, byConv, byConvChart, convExcludedCount, byDeals, bySlitted, anyHasLostDetail, totalRev, totalLeadsAll, avgConv, deptAvgCheck, mgrAnalysis, convStd, mgrColor} = _dma;
 
   // ── СВОДНЫЙ РЕЙТИНГ (заменяет 4 разрозненные карточки-лидерборда) ──────
   const compositeScores={};
@@ -6783,7 +6643,7 @@ function renderCompare(){
     const score=compositeScores[m.id];
     const col=score.composite>=70?'var(--green-m)':score.composite>=45?'var(--amber-m)':'var(--red-m)';
     const risk=mgrAnalysis[m.id]?.gapRevenue||0;
-    return `<button onclick="openMgrModal('${m.id}')" class="rank-row" style="background:transparent">
+    return `<button onclick="openTcDossier('${m.id}','${mgrDossierPeriod(m)}')" class="rank-row" style="background:transparent">
       <div style="width:18px;text-align:right;font-size:11px;font-weight:700;color:var(--muted)">${idx+1}</div>
       <div style="width:34px;height:34px;border-radius:50%;background:${m.color};display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;font-weight:800;flex-shrink:0">${(m.name||'?')[0]}</div>
       <div style="flex:1;min-width:0">
@@ -6870,7 +6730,7 @@ function renderCompare(){
   const signalsHtml=signalRows.length?`<div class="card" style="--card-accent:var(--red-m);display:flex;flex-direction:column">
     <div class="card-head" style="margin-bottom:4px"><div class="card-title">⚠ Сигналы, требующие внимания</div></div>
     <div>
-    ${signalRows.map(x=>`<button onclick="openMgrModal('${x.m.id}')" style="all:unset;box-sizing:border-box;cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 4px;border-top:3px solid ${sevColor(x.worstSev)};border-bottom:1px solid var(--border);width:100%;border-radius:6px;transition:background var(--dur) var(--ease)" onmouseover="this.style.background='var(--s2)'" onmouseout="this.style.background='transparent'">
+    ${signalRows.map(x=>`<button onclick="openTcDossier('${x.m.id}','${mgrDossierPeriod(x.m)}')" style="all:unset;box-sizing:border-box;cursor:pointer;display:flex;justify-content:space-between;gap:10px;padding:8px 4px;border-top:3px solid ${sevColor(x.worstSev)};border-bottom:1px solid var(--border);width:100%;border-radius:6px;transition:background var(--dur) var(--ease)" onmouseover="this.style.background='var(--s2)'" onmouseout="this.style.background='transparent'">
       <span style="font-size:12px;font-weight:700;flex-shrink:0">${x.m.name}</span>
       <span style="font-size:11px;text-align:right">${x.items.map(i=>`<span style="color:${sevColor(i.sev)}">${i.text}</span>`).join(' <span style="opacity:.4">·</span> ')}</span>
     </button>`).join('')}
@@ -6924,7 +6784,7 @@ function renderCompare(){
         const riskCol=m.gapRevenue>0?'var(--red-m)':'var(--muted)';
         return `<tr>
           <td style="font-weight:800;color:${m.color}">${i+1}</td>
-          <td><button onclick="openMgrModal('${m.id}')" class="link-btn"><b>${m.name}</b></button></td>
+          <td><button onclick="openTcDossier('${m.id}','${mgrDossierPeriod(m)}')" class="link-btn"><b>${m.name}</b></button></td>
           <td class="r">${fmt(m.leads)}</td>
           <td class="r">${fmt(m.deals)}</td>
           <td class="r" style="color:var(--muted)">${fmt(m.newDeals||0)}</td>
@@ -6968,7 +6828,7 @@ function renderCompare(){
       const lowSample=v.leads<3?' hm-lowsample':'';
       return `<td class="${hc}${lowSample}" title="${src}: ${conv.toFixed(1)}% (${fmt(v.deals)}/${fmt(v.leads)} лидов)">${conv.toFixed(0)}%<br><span style="font-size:8px;opacity:.7">n=${fmt(v.leads)}</span></td>`;
     }).join('');
-    return `<tr><td class="mgr"><button onclick="openMgrModal('${m.id}')" class="link-btn"><b>${m.name}</b></button></td>${cells}</tr>`;
+    return `<tr><td class="mgr"><button onclick="openTcDossier('${m.id}','${mgrDossierPeriod(m)}')" class="link-btn"><b>${m.name}</b></button></td>${cells}</tr>`;
   }).join('');
   const heatHtml=`<div class="card" style="grid-column:1/-1">
     <div class="card-head" style="margin-bottom:12px"><div class="card-title">🔥 Тепловая карта конверсии: Менеджер × Источник</div><span style="font-size:10px;color:var(--muted)">n = число лидов, тусклые ячейки — мало данных (n&lt;3), клик по имени — карточка менеджера${allSrcsFull.length>10?` · показаны топ-10 источников из ${allSrcsFull.length}`:''}</span></div>
@@ -7021,10 +6881,6 @@ function renderCompare(){
 
   document.getElementById('cmp-top').innerHTML=
     deptBreakdownHtml+rankingHtml+signalsHtml+chartsHtml+tableHtml+heatHtml;
-
-  // Снимок данных для модалки карточки менеджера (см. openMgrModal) — открытие
-  // модалки больше не дёргает renderCompare() целиком, а просто читает отсюда.
-  _cmpLastState = {mgrData, byRev, avgConv, mgrAnalysis, deptAvgCheck};
 
   // Стоимость слитых лидов
   renderLeadLossBlock();
@@ -8765,6 +8621,16 @@ function tcDossierTemplate(d, managerId, teamAvg){
   const decline = tcDeclineReasonsSummary(managerId, d.period);
   const leadCostsConfigured = !!(cfg.leadCosts && Object.keys(cfg.leadCosts).length);
   const teamN = teamAvg ? teamAvg.n - 1 : 0;
+  // Причинный анализ (ожидаемая конверсия по миксу каналов, риск ₸) и экономика
+  // повторных клиентов — раньше существовали ТОЛЬКО в отдельной карточке менеджера
+  // в «Сравнении» (buildMgrProfileHtml). 06.08.2026 обе реализации объединены в
+  // одно досье (см. computeDeptMgrAnalysis) — теперь показывается здесь независимо
+  // от того, откуда открыли досье (Командный центр или drill-down из Сравнения).
+  // dm/dmA — null, если у менеджера нет рекламной сессии за d.period (например,
+  // период известен только по накладным) — блок ниже тогда просто не рендерится.
+  const deptAnalysis = computeDeptMgrAnalysis(d.period);
+  const dm = deptAnalysis ? deptAnalysis.mgrData.find(x=>x.id===managerId) : null;
+  const dmA = (deptAnalysis && dm) ? (deptAnalysis.mgrAnalysis[dm.id]||{}) : null;
 
   return `
     <button class="tc-dossier-close" onclick="closeTcDossier()">✕</button>
@@ -8812,6 +8678,27 @@ function tcDossierTemplate(d, managerId, teamAvg){
         ${tcCmpRow('План', k.planPct, teamAvg.planPct, v=>v.toFixed(0)+'%')}
       ` : `<div style="font-size:12px;color:var(--slate)">Недостаточно данных по отделу за этот период для сравнения.</div>`}
     </div>
+    ${dm ? `<div class="tc-panel" style="margin-bottom:16px">
+      <div class="tc-panel-title">Причинный анализ и точка роста</div>
+      ${dmA && dmA.expectedConv!==null && dmA.expectedConv!==undefined ? `<div style="font-size:12px;color:var(--slate);margin-bottom:4px">Ожидаемая конверсия по миксу каналов: <b style="color:var(--ink)">${dmA.expectedConv.toFixed(1)}%</b> · факт ${dmA.convVsExpected>=0?'выше':'ниже'} на <b style="color:${dmA.convVsExpected>=0?'var(--green-m)':'var(--red-m)'}">${dmA.convVsExpected>=0?'+':''}${dmA.convVsExpected.toFixed(1)}%</b></div>` : ''}
+      ${dmA && dmA.gapRevenue>0 ? `<div style="font-size:12px;color:var(--slate);margin-bottom:4px">Если бы конверсия была на уровне отдела (${deptAnalysis.avgConv.toFixed(1)}%): <b style="color:var(--red-m)">+${tcFmtM(dmA.gapRevenue)}</b> к рекламной выручке</div>` : ''}
+      <div style="font-size:12.5px;color:var(--ink);font-weight:600">💡 ${mgrRecommendation(dm, dmA||{}, deptAnalysis.avgConv, deptAnalysis.deptAvgCheck)}</div>
+    </div>
+    <div class="tc-panel" style="margin-bottom:16px">
+      <div class="tc-panel-title">Экономика повторных клиентов (реклама)</div>
+      ${(()=>{
+        const repRevenue=dm.repRevenue||0;
+        const newRevenue=Math.max(0,dm.revenue-repRevenue);
+        const repAvgCheck=dm.repDeals?repRevenue/dm.repDeals:null;
+        const newAvgCheck=dm.newDeals?newRevenue/dm.newDeals:null;
+        const repRevShare=dm.revenue?repRevenue/dm.revenue*100:null;
+        return `<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px">
+          <div><span style="color:var(--slate)">Чек новых:</span><br><b>${newAvgCheck!==null?tcFmtM(newAvgCheck):'—'}</b></div>
+          <div><span style="color:var(--slate)">Чек повторных:</span><br><b>${repAvgCheck!==null?tcFmtM(repAvgCheck):'—'}</b></div>
+          <div><span style="color:var(--slate)">Доля выручки от базы:</span><br><b>${repRevShare!==null?repRevShare.toFixed(0)+'%':'—'}</b></div>
+        </div>`;
+      })()}
+    </div>` : ''}
     <div class="tc-grid2" style="margin-bottom:16px">
       <div class="tc-panel">
         <div class="tc-panel-title">Возвраты и накладные</div>
@@ -8912,9 +8799,8 @@ function askOpenMgrFull(managerId, period){
 }
 
 // Esc закрывает досье/историю в tc-overlay — та же логика уже есть у
-// mgr-drill-modal (_mgrModalEscHandler) и командной палитры; здесь её не было,
-// хотя оверлей используется в 3 местах (досье менеджера, история решения,
-// карточка из «Сегодня»).
+// командной палитры; здесь её не было, хотя оверлей используется в 3 местах
+// (досье менеджера, история решения, карточка из «Сегодня»).
 function _tcOverlayEscHandler(e){ if(e.key === 'Escape') closeTcDossier(); }
 
 function openTcOverlay(){
