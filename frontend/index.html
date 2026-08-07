@@ -314,6 +314,15 @@ textarea:focus-visible,
   display: flex;
 }
 
+/* Открыта под-страница «Отчётов» (Обзор/Источники/Менеджер/Прогноз) — у
+   #page-ask остаётся только топбар с кнопкой «Назад к выбору», ask-menu
+   спрятан. Схлопываем #page-ask до высоты контента вместо flex:1, чтобы вся
+   остальная высота .main доставалась активной под-странице, а не делилась
+   пополам (баг с пустым пространством сверху, найден 07.08.2026). */
+#page-ask.ask-sub-active {
+  flex: 0 0 auto;
+}
+
 /* =================================================================
    TOPBAR
    ================================================================= */
@@ -2744,6 +2753,9 @@ select.combo-native-hidden {
     <!-- 5b. Рекомендации по каналам (2×2 матрица приоритетов) -->
     <div id="ov-recommendations"></div>
 
+    <!-- 5c. Причины отказа за месяц (по всему отделу или выбранному менеджеру) -->
+    <div class="card" id="ov-decline-card"></div>
+
     <!-- 6. ABC + Pareto -->
     <div class="card">
       <div class="card-head">
@@ -2870,6 +2882,7 @@ select.combo-native-hidden {
   </div>
   <div id="cmp-content" class="hidden">
     <div class="grid2" id="cmp-top" style="margin-bottom:14px"></div>
+    <div class="card" id="cmp-decline-card" style="margin-bottom:14px"></div>
     <div id="cmp-lead-loss"></div>
     <div id="cmp-ai-analysis"></div>
   </div>
@@ -3281,6 +3294,7 @@ function askShow(id){
   if(!ASK_SUBS.includes(id)) return;
   document.getElementById('ask-menu').classList.add('hidden');
   document.getElementById('ask-back-btn').classList.remove('hidden');
+  document.getElementById('page-ask').classList.add('ask-sub-active');
   ASK_SUBS.forEach(sid => {
     document.getElementById('page-'+sid).classList.toggle('hidden', sid !== id);
   });
@@ -3311,6 +3325,7 @@ function askBack(){
   ASK_SUBS.forEach(sid => document.getElementById('page-'+sid).classList.add('hidden'));
   document.getElementById('ask-menu').classList.remove('hidden');
   document.getElementById('ask-back-btn').classList.add('hidden');
+  document.getElementById('page-ask').classList.remove('ask-sub-active');
   askActiveSub = null;
   updateSidebarSub();
 }
@@ -5085,6 +5100,11 @@ function renderOverview(){
   </div>`;
   document.getElementById('ov-import-report').innerHTML=reportHtml;
 
+  // Причины отказа за месяц — по запросу пользователя 07.08.2026: раньше были видны
+  // только в досье отдельного менеджера, здесь агрегируем в скоупе «Обзора» (весь
+  // отдел или выбранный менеджер, тот же period, что и в остальном обзоре).
+  renderMgrDeclineReasons(sess.mgrId===null?DEPT_MGR_ID:sess.mgrId, sess.period, 'ov-decline-card');
+
   // KPI — план и «общая выручка» по правильному скоупу: для «Весь отдел» — periodTargets
   // (ручной ввод компании + план отдела), для конкретного менеджера — его личный план
   // (mgrPlans) и его личные накладные. ДО этой правки здесь всегда брались periodTargets и
@@ -6007,8 +6027,9 @@ function isEmptyDeclineReason(reason){
 // ВЫБОРКА (~20-30 последних отказов на менеджера за период), НЕ исчерпывающий
 // список. sample_size показывает размер среза, чтобы доля каждой причины
 // читалась как «X% из выборки N», а не как точная доля всех отказов.
-function renderMgrDeclineReasons(mgrId, period){
-  const card = document.getElementById('mgr-decline-card');
+function renderMgrDeclineReasons(mgrId, period, containerId){
+  containerId = containerId || 'mgr-decline-card';
+  const card = document.getElementById(containerId);
   if(!card) return;
   const isDept = mgrId===DEPT_MGR_ID;
   const rows = declineReasons.filter(r =>
@@ -6902,6 +6923,11 @@ function renderCompare(){
 
   document.getElementById('cmp-top').innerHTML=
     deptBreakdownHtml+rankingHtml+signalsHtml+chartsHtml+tableHtml+heatHtml;
+
+  // Причины отказа — отдельный дашборд по запросу пользователя 07.08.2026: самые
+  // частые причины по отделу за тот же скоуп (менеджер/период), что и остальная
+  // страница — period тут может быть и 'all' (renderMgrDeclineReasons это умеет).
+  renderMgrDeclineReasons(DEPT_MGR_ID, period, 'cmp-decline-card');
 
   // Стоимость слитых лидов
   renderLeadLossBlock();
