@@ -3615,13 +3615,14 @@ async function boot() {
       }
     }
 
-    // Загружаем все сессии с данными
+    // Загружаем все сессии с данными — ПАРАЛЛЕЛЬНО (было: for...of с await
+    // внутри, по одной сессии за раз — на 40+ сессиях эта последовательная
+    // цепочка занимала секунды, чего хватало, чтобы 4-секундный fallback
+    // ниже сорвал splash ДО реального завершения загрузки — см. большой
+    // комментарий выше про баг «срок не выбирается / рейтинг скачет»).
     const sessionsData = await apiGet('/sessions');
-    sessions = [];
-    for (const s of sessionsData) {
-      const sess = await loadSession(s.id, s);
-      if (sess) sessions.push(sess);
-    }
+    const loadedSessions = await Promise.all(sessionsData.map(s => loadSession(s.id, s)));
+    sessions = loadedSessions.filter(Boolean);
 
     // Накладные (Pillar A, деньги) — независимый источник, отдельно от live-tree Сквозной
     invoiceStats = await apiGet('/invoices').catch(() => []);
@@ -7935,14 +7936,20 @@ function renderHealthBar(){
   el.innerHTML = indicators.join('');
 }
 document.addEventListener("DOMContentLoaded", function(){
-  // Принудительно скрываем splash через 4 секунды в любом случае
+  // Fallback ТОЛЬКО на случай реального зависания (сеть легла / бэкенд не
+  // отвечает) — 4с было слишком мало и гонялось с реальным временем boot()
+  // (см. комментарий у sessions = await Promise.all(...) выше): splash мог
+  // пропасть раньше, чем sessions[] действительно догрузились, открывая
+  // доступ к кликам по частично загруженному сайту. 15с — с запасом больше
+  // реалистичного времени параллельной загрузки, но всё ещё защищает от
+  // бесконечного зависания.
   setTimeout(() => {
     const splash = document.getElementById('splash-screen');
     if(splash && !splash.classList.contains('hidden')) {
       splash.classList.add('hidden');
       setTimeout(() => { if(splash.parentNode) splash.remove(); }, 500);
     }
-  }, 4000);
+  }, 15000);
   boot();
 });
 // ── AI АНАЛИЗ МЕНЕДЖЕРОВ (кэшируется на сервере) ────────────────
