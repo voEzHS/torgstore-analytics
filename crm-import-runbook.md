@@ -321,9 +321,14 @@ discount_amount_чистый = totalSumWithoutDiscount(sp=0)  - Σ totalSumWitho
 ```js
 const UCENKA_IDS = [27, 29, 228, 236, 243, 577];
 
+// ⚠️ ОБЯЗАТЕЛЕН status_id[]=8 (Доставлено) — без него totalSum завышен почти
+// в 1.5 раза (сумма по ВСЕМ статусам, а не только по факту доставленных).
+// Найдено и подтверждено 07.08.2026 сверкой с реальным browser-запросом
+// (Claude in Chrome → read_network_requests после ручной установки фильтров
+// в UI CRM) — см. «Проверено 07.08.2026» ниже.
 async function totalSumRaw(crmManagerId, dateFrom, dateTo, shipmentPoint){
   const dr = encodeURIComponent(`${dateFrom} - ${dateTo}`); // формат ДД/ММ/ГГГГ
-  const url = `/service/warehouse/products/requests/total-sum-ajax?search=&sortby=default&smart=&sku=&client_name=&type=any&date=other&date_other=${dr}&date_assembled=${dr}&date_completed=${dr}&date_delivered=${dr}&date_returned=${dr}&date_canceled=${dr}&date_debt=${dr}&invoice_sum_from=&invoice_sum_to=&client_id=&manager_id=${crmManagerId}&assembler_id=all&packager_id=all&courier_id=all&payments_method=0&discount_id=any&sale_channel=0&utm_source=0&utm_medium=&utm_campaign=&utm_term=&utm_content=&bill_id=0&service_point=0&shipment_point=${shipmentPoint}&return_warehouse=0&with_docs=all&promotion=all&via_source=0&page=0&path=/service/warehouse/products/requests`;
+  const url = `/service/warehouse/products/requests/total-sum-ajax?search=&sortby=default&smart=&sku=&client_name=&type=any&date=other&date_other=${dr}&date_assembled=${dr}&date_completed=${dr}&date_delivered=${dr}&date_returned=${dr}&date_canceled=${dr}&date_debt=${dr}&invoice_sum_from=&invoice_sum_to=&client_id=&manager_id=${crmManagerId}&assembler_id=all&packager_id=all&courier_id=all&payments_method=0&discount_id=any&sale_channel=0&utm_source=0&utm_medium=&utm_campaign=&utm_term=&utm_content=&bill_id=0&service_point=0&shipment_point=${shipmentPoint}&return_warehouse=0&with_docs=all&promotion=all&via_source=0&page=0&path=/service/warehouse/products/requests&status_id[]=8`;
   const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
   const j = await r.json();
   const num = s => Number(String(s).replace(/[^\d.-]/g,'')) || 0;
@@ -351,19 +356,39 @@ async function discountClean(crmManagerId, dateFrom, dateTo){
 как раньше (раздел 2) — формат payload не меняется, меняется только то, ЧТО
 подставляется в эти два поля (очищенное от уценки, а не сырое).
 
-### Проверено 07.08.2026 (Ерганат Аубакир, июль 2026)
+### Проверено 07.08.2026 (Ерганат Аубакир, июль 2026) — исправлено после аудита
 
-- Все склады: sale=44,584,633₸, discount=3,917,087₸
+Первая версия этого раздела (без `status_id[]=8`) давала sale=44,584,633₸ —
+это сумма по ВСЕМ статусам, а не только «Доставлено», поэтому число было
+завышено. Ниже — исправленные цифры, сверенные с реальным запросом браузера
+(через ручную установку фильтров в UI CRM + `read_network_requests`):
+
+- Все склады, статус=Доставлено (`status_id[]=8`): sale=29,920,319₸, discount=3,065,401₸
 - Только «Уценка (Хаб)» (id 29): sale=134,550₸, discount=14,950₸
-- Только «Уценка» (id 27): sale=0₸, discount=0₸ (у этого менеджера пусто)
+- Остальные 5 складов уценки (27, 228, 236, 243, 577): sale=0₸, discount=0₸ (у этого менеджера пусто в июле)
+- Итого уценка: sale=134,550₸ (0.45% от общей суммы), discount=14,950₸ (0.49% от общей скидки)
+- «Чистая» скидка (без уценки): sale=29,785,769₸, discount=3,050,451₸
 
-Т.е. у этого конкретного менеджера уценка — маленькая доля (~0.3%), но по
-другим менеджерам/периодам доля может быть куда больше — этим и объясняется,
-зачем это разделять, а не просто списать как погрешность.
+У этого конкретного менеджера уценка — маленькая доля (<0.5%), но по другим
+менеджерам/периодам доля может быть куда больше — этим и объясняется, зачем
+это разделять, а не просто списать как погрешность. Полная проверка по всем
+менеджерам не проводилась (дорого по времени из-за правила 3с × 7 запросов
+на менеджера) — делать по явному запросу пользователя.
+
+⚠️ **Отдельная находка аудита 07.08.2026, не связанная с уценкой:** «чистая»
+сумма выше (29.9M₸) всё равно НЕ совпадает с тем, что сейчас лежит в БД сайта
+для Ерганата за июль (21.3M₸ sale / 2.0M₸ discount) — это старый снепшот,
+загруженный раньше. Расхождение объясняется, скорее всего, тем, что статус
+«Доставлено» у части накладных наступает ПОЗЖЕ создания — с момента импорта
+прошло время, и больше накладных за июль успели дойти до статуса «Доставлено»,
+чем было на момент снепшота. Это ожидаемое поведение снепшота, а не баг
+методологии — но означает, что цифры скидок в БД дрейфуют и стареют так же,
+как и другие «снепшотные» метрики на сайте.
 
 **Пока НЕ переделаны задним числом** уже загруженные скидки за июнь/июль/август
-(они всё ещё считают уценку как часть скидки менеджера) — это отдельная задача,
-делать только по явному запросу пользователя.
+(они всё ещё считают уценку как часть скидки менеджера И основаны на старом
+снепшоте статусов) — это отдельная задача, делать только по явному запросу
+пользователя.
 
 ## 4. Главный урок сессии 26.07.2026
 
