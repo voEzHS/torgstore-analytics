@@ -268,6 +268,103 @@ Content-Type: application/json
   инвалидация кэша аналитики: `PATCH /api/v1/settings/cache_version` со
   значением на 1 больше текущего.
 
+## 3.5 Скидки БЕЗ учёта УЦЕНКИ (найдено 07.08.2026)
+
+Уценённые товары получают скидку от компании (списание/уценка склада), а не от
+менеджера — эту скидку нельзя приписывать менеджеру при расчёте его личной
+скидочной активности. Раньше `discounts.py` (раздел 2, `total-sum-ajax`) брал
+`totalSum`/`totalSumWithoutDiscount` по ВСЕМ складам сразу — это завышало
+«скидку менеджера» на сумму уценки.
+
+### Как технически отделить
+
+У `total-sum-ajax` есть параметр `shipment_point` («Точка отгрузки» /
+«склад отправки» в фильтрах CRM: Склад → Накладные → Фильтры). Это `<select>`
+с ОДНИМ значением (не мультивыбор), `0` = все склады. Найденные склады, чьё
+название содержит «УЦЕНКА» (проверено 07.08.2026, могут появляться новые —
+проверять периодически через `document.querySelector('select[name="shipment_point"]').options`):
+
+| ID | Название |
+|---|---|
+| 27 | Уценка |
+| 29 | Уценка (Хаб) |
+| 228 | Уценка Шымкент |
+| 236 | Уценка Астана |
+| 243 | Шымкент Витрина Уценка |
+| 577 | Уценка Магазин Шымкент |
+
+(Ещё есть 32 «Уценка (Шымкент)» и 33 «Уценка (Астана)» — встречаются в
+`service_point`/«Точка обслуживания», но не в списке `shipment_point`; на
+всякий случай можно тоже проверить, если суммы не сойдутся.)
+
+### Формула
+
+Так как `shipment_point` не мультивыбор, «исключить уценку» одним запросом
+нельзя — считаем через вычитание:
+
+```
+sale_amount_чистый     = totalSum(shipment_point=0)     - Σ totalSum(shipment_point=<id уценки>)
+discount_amount_чистый = totalSumWithoutDiscount(sp=0)  - Σ totalSumWithoutDiscount(sp=<id уценки>)
+```
+
+Это значит **7 запросов на менеджера/период** вместо 1 (общий + 6 по складам
+уценки) — с правилом 3с это ~21с на менеджера, для 17 менеджеров ~6 минут.
+Это нормально, скорость не важна (см. §0).
+
+⚠️ Важно про параметр `date`: если оставить `date=any`, `date_other` (диапазон
+дат) ИГНОРИРУЕТСЯ и CRM отдаёт сумму за всю историю — это подтверждённый
+баг/особенность CRM, найден 07.08.2026 при тестировании. **Обязательно ставить
+`date=other`**, чтобы `date_other=<ДД/ММ/ГГГГ - ДД/ММ/ГГГГ>` реально применился.
+
+### Готовый скрипт (консоль вкладки CRM, guard из §0 уже должен быть вставлен)
+
+```js
+const UCENKA_IDS = [27, 29, 228, 236, 243, 577];
+
+async function totalSumRaw(crmManagerId, dateFrom, dateTo, shipmentPoint){
+  const dr = encodeURIComponent(`${dateFrom} - ${dateTo}`); // формат ДД/ММ/ГГГГ
+  const url = `/service/warehouse/products/requests/total-sum-ajax?search=&sortby=default&smart=&sku=&client_name=&type=any&date=other&date_other=${dr}&date_assembled=${dr}&date_completed=${dr}&date_delivered=${dr}&date_returned=${dr}&date_canceled=${dr}&date_debt=${dr}&invoice_sum_from=&invoice_sum_to=&client_id=&manager_id=${crmManagerId}&assembler_id=all&packager_id=all&courier_id=all&payments_method=0&discount_id=any&sale_channel=0&utm_source=0&utm_medium=&utm_campaign=&utm_term=&utm_content=&bill_id=0&service_point=0&shipment_point=${shipmentPoint}&return_warehouse=0&with_docs=all&promotion=all&via_source=0&page=0&path=/service/warehouse/products/requests`;
+  const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
+  const j = await r.json();
+  const num = s => Number(String(s).replace(/[^\d.-]/g,'')) || 0;
+  return { sale: num(j.totalSum), discount: num(j.totalSumWithoutDiscount) };
+}
+
+// Пример: Ерганат Аубакир (CRM id 566), Июль 2026
+async function discountClean(crmManagerId, dateFrom, dateTo){
+  const all = await totalSumRaw(crmManagerId, dateFrom, dateTo, 0);
+  let ucenkaSale = 0, ucenkaDiscount = 0;
+  for (const id of UCENKA_IDS){
+    const u = await totalSumRaw(crmManagerId, dateFrom, dateTo, id); // throttle сам подождёт 3с
+    ucenkaSale += u.sale; ucenkaDiscount += u.discount;
+  }
+  return {
+    sale_amount: all.sale - ucenkaSale,
+    discount_amount: all.discount - ucenkaDiscount,
+    _debug: { all, ucenkaSale, ucenkaDiscount }
+  };
+}
+// await discountClean(566, '01/07/2026', '31/07/2026')
+```
+
+Результат (`sale_amount`/`discount_amount`) передавать в `POST /discounts/import`
+как раньше (раздел 2) — формат payload не меняется, меняется только то, ЧТО
+подставляется в эти два поля (очищенное от уценки, а не сырое).
+
+### Проверено 07.08.2026 (Ерганат Аубакир, июль 2026)
+
+- Все склады: sale=44,584,633₸, discount=3,917,087₸
+- Только «Уценка (Хаб)» (id 29): sale=134,550₸, discount=14,950₸
+- Только «Уценка» (id 27): sale=0₸, discount=0₸ (у этого менеджера пусто)
+
+Т.е. у этого конкретного менеджера уценка — маленькая доля (~0.3%), но по
+другим менеджерам/периодам доля может быть куда больше — этим и объясняется,
+зачем это разделять, а не просто списать как погрешность.
+
+**Пока НЕ переделаны задним числом** уже загруженные скидки за июнь/июль/август
+(они всё ещё считают уценку как часть скидки менеджера) — это отдельная задача,
+делать только по явному запросу пользователя.
+
 ## 4. Главный урок сессии 26.07.2026
 
 Если в CRM уже есть готовое посчитанное поле (как `conversion` в
