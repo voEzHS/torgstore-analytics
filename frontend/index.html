@@ -6375,10 +6375,14 @@ function stddevArr(arr){
   return Math.sqrt(arr.reduce((s,v)=>s+(v-avg)**2,0)/arr.length);
 }
 // «Все периоды» в Сравнении → m.periods (массив, отсортирован по хронологии),
-// а единое досье (openTcDossier) принимает ровно один period. Берём самый свежий —
-// единственное место, где выбор «Все периоды» теряет детализацию при открытии
-// досье; принято сознательно 06.08.2026 при объединении карточки Сравнения и
-// досье Командного центра в одну реализацию (см. computeDeptMgrAnalysis выше).
+// а единое досье (openTcDossier) принимает ровно один period. Открываем самый
+// свежий как отправную точку (обычно это и есть то, что интересует по умолчанию —
+// текущее состояние менеджера), а не потому что это единственный вариант: 08.08.2026
+// добавлен явный переключатель периода прямо в шапке досье (tcDossierTemplate →
+// periodOptions/<select>), так что если открылся не тот срез, который человек
+// только что сравнивал, это сразу видно и переключается одним кликом — раньше
+// (06.08.2026, объединение карточки Сравнения и досье Командного центра) этот
+// выбор был и молчаливым, и неисправимым внутри самого досье.
 function mgrDossierPeriod(m){
   return (m.periods && m.periods.length) ? m.periods[m.periods.length-1] : m.period;
 }
@@ -8690,6 +8694,18 @@ function tcDossierTemplate(d, managerId, teamAvg){
   const dm = deptAnalysis ? deptAnalysis.mgrData.find(x=>x.id===managerId) : null;
   const dmA = (deptAnalysis && dm) ? (deptAnalysis.mgrAnalysis[dm.id]||{}) : null;
 
+  // Досье технически может показать только ОДИН период за раз (см. openTcDossier/
+  // manager_dossier — period обязателен и один). Раньше при открытии из Сравнения
+  // в режиме «Все периоды» (mgrDossierPeriod) это молча превращалось в последний
+  // период менеджера, без единого признака, что именно показано — карточка «не
+  // подстраивалась» под то, что человек только что смотрел в Сравнении, и не было
+  // способа это заметить или поправить. periodOptions/селектор ниже не решают
+  // саму задачу агрегации по нескольким периодам (её тут в принципе нет и не может
+  // быть без отдельного агрегирующего эндпоинта), но убирают немоту: период всегда
+  // виден и его можно тут же переключить одним кликом на любой из последних до 6
+  // периодов менеджера (d.history — тот же список, что и в графике ниже).
+  const periodOptions = [...new Set([...(d.history||[]).map(h=>h.period), d.period])];
+
   return `
     <button class="tc-dossier-close" onclick="closeTcDossier()">✕</button>
     <div class="tc-d-head">
@@ -8703,6 +8719,15 @@ function tcDossierTemplate(d, managerId, teamAvg){
       <div>
         <div class="tc-d-name">${d.name}</div>
         <div class="tc-d-rank">#${d.rank} из ${d.totalManagers} в отделе · composite ${d.composite}/100 · ${TC_STATUS_LABEL[d.status]||d.status}</div>
+        <div style="display:flex;align-items:center;gap:6px;margin-top:4px">
+          <span style="font-size:10px;color:var(--muted)">Показан период:</span>
+          ${periodOptions.length>1
+            ? `<select onchange="openTcDossier('${managerId}', this.value)" style="font-size:11px;font-weight:700;padding:2px 6px;border-radius:6px;border:1px solid var(--border);background:var(--bg);color:inherit;cursor:pointer" title="Досье всегда показывает ровно один период — если открылось не то, что ожидалось (например, кликнули из Сравнения при «Все периоды»), переключите здесь">
+                ${periodOptions.map(p=>`<option value="${p}" ${p===d.period?'selected':''}>${p}</option>`).join('')}
+              </select>`
+            : `<b style="font-size:11px">${d.period}</b>`
+          }
+        </div>
       </div>
     </div>
     <div class="tc-tiles">
