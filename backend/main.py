@@ -30,6 +30,7 @@ from backend.routers import (
     discounts,
     decisions,
     decline_reasons,
+    freshness,
 )
 from backend.routers import ai
 
@@ -74,7 +75,11 @@ app.add_middleware(
 _BASIC_AUTH_USER = os.environ.get("BASIC_AUTH_USER")
 _BASIC_AUTH_PASSWORD = os.environ.get("BASIC_AUTH_PASSWORD")
 _BASIC_AUTH_ENABLED = bool(_BASIC_AUTH_USER and _BASIC_AUTH_PASSWORD)
-_UNPROTECTED_PATHS = {"/api/v1/health"}
+# /data-freshness отдаёт только метаданные о времени последнего импорта
+# (никаких сумм/имён/выручки) — специально без авторизации, чтобы ежедневный
+# scheduled task мог проверять актуальность данных, не храня в себе
+# CRM/Basic-Auth креды сайта (см. backend/routers/freshness.py).
+_UNPROTECTED_PATHS = {"/api/v1/health", "/api/v1/data-freshness"}
 
 
 @app.middleware("http")
@@ -114,6 +119,7 @@ app.include_router(invoices.router,        prefix="/api/v1")
 app.include_router(discounts.router,      prefix="/api/v1")
 app.include_router(decisions.router,      prefix="/api/v1")
 app.include_router(decline_reasons.router, prefix="/api/v1")
+app.include_router(freshness.router,      prefix="/api/v1")
 app.include_router(ai.router,             prefix="/api/v1")
 
 # Статика: фронтенд

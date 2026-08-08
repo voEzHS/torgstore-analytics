@@ -315,7 +315,11 @@ class InvoiceStats(Base):
     source         = Column(Text, default="top_prodazh_widget")
     snapshot_at    = Column(TIMESTAMP(timezone=True), server_default=func.now())
     created_at     = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at     = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # onupdate — без него это поле было "created_at под другим именем": при
+    # повторном импорте (upsert по manager_id+period+channel+city) значение
+    # никогда не обновлялось, сигнал "когда данные реально в последний раз
+    # подтягивались" был неверным. Нужно для /data-freshness (08.08.2026).
+    updated_at     = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class DeclineReasonStats(Base):
@@ -341,7 +345,8 @@ class DeclineReasonStats(Base):
     source        = Column(Text, default="crm_lead_custom_field_sample")
     snapshot_at   = Column(TIMESTAMP(timezone=True), server_default=func.now())
     created_at    = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at    = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # onupdate — см. комментарий у InvoiceStats.updated_at выше (тот же баг).
+    updated_at    = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class ManagerDiscount(Base):
@@ -367,7 +372,8 @@ class ManagerDiscount(Base):
     source          = Column(Text, default="warehouse_requests_total_sum_ajax")
     snapshot_at     = Column(TIMESTAMP(timezone=True), server_default=func.now())
     created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
-    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    # onupdate — см. комментарий у InvoiceStats.updated_at выше (тот же баг).
+    updated_at      = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class Decision(Base):
