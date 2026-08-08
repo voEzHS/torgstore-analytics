@@ -4726,6 +4726,46 @@ const cc=v=>{if(v===null||v>100)return'var(--muted)';return v>=cfg.cg?'var(--gre
 const bdg=v=>{if(v===null)return'bn';if(v>100)return'berr';return v>=cfg.cg?'bg':v>=cfg.cm?'bw':'bb'};
 const lbl=v=>{if(v===null)return'—';if(v>100)return'⚠️ Ошибка';return v>=cfg.cg?'✅ Отлично':v>=cfg.cm?'⚠️ Средне':'❌ Слабо'};
 
+// ══ PACE — темп выполнения плана с учётом даты ═══════════════════════════
+// Единственный источник этой логики на фронтенде — дословный аналог
+// backend/analytics/pace.py::compute_pace (см. докстринг там же про то, зачем
+// это вообще нужно: "план выполнен на X%" без даты бессмысленен — на 3-й день
+// месяца 10% это норма, на 28-й — уже тревожно). computePace() используется
+// в Обзоре, Менеджере, Сравнении и Командном центре — если формулы
+// разъедутся, руководитель увидит разные % на разных экранах за один и тот
+// же период (тот же принцип, что и в team_center.py про дублирование формул
+// фронт/бэк).
+// Возвращает null, если план не задан, период не парсится либо период ещё
+// не наступил (план на будущее — темп сравнивать не с чем).
+const PACE_MONTH_NAMES = ['Январь','Февраль','Март','Апрель','Май','Июнь',
+                           'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+function computePace(period, plan, actualRevenue){
+  if(!plan) return null;
+  const m = String(period||'').match(/^(\S+)\s+(\d{4})$/);
+  if(!m) return null;
+  const monthIdx = PACE_MONTH_NAMES.indexOf(m[1]); // 0-based
+  if(monthIdx < 0) return null;
+  const year = parseInt(m[2]);
+  const now = new Date();
+  if(year > now.getFullYear() || (year===now.getFullYear() && monthIdx > now.getMonth())) return null; // план на будущий период
+  const daysInMonth = new Date(year, monthIdx+1, 0).getDate();
+  const isCurrentPeriod = year===now.getFullYear() && monthIdx===now.getMonth();
+  const dayOfMonth = isCurrentPeriod ? now.getDate() : daysInMonth; // прошедший период = месяц закрыт целиком
+  const rev = actualRevenue || 0;
+  const expectedPct = dayOfMonth/daysInMonth*100;
+  const expectedRevenue = plan*dayOfMonth/daysInMonth;
+  const actualPct = rev/plan*100;
+  const gapPct = actualPct - expectedPct;
+  const gapRevenue = rev - expectedRevenue;
+  return {
+    daysInMonth, dayOfMonth,
+    isCurrentPeriod, isPastPeriod: !isCurrentPeriod,
+    expectedPct, expectedRevenue, actualPct,
+    gapPct, gapRevenue,
+    onPace: gapPct >= -5,          // допуск ±5 п.п. — не дёргаться от шума одного дня
+  };
+}
+
 function kpi(label,val,vcls,sub,scls,delta,rawNum,fmtType){
   const iconMap={
     'Лидов':'ti-users','Продаж':'ti-shopping-cart','Конверсия':'ti-percent',
@@ -5165,34 +5205,24 @@ function renderOverview(){
     '</div>'
   // animateKpis вызывается после splash или при nav()
 
-  // ── Pace — темп выполнения плана ─────────────────────────────────
-  // Считаем только если есть план и выручка за текущий месяц
-  // ── Pace: темп выполнения плана ──────────────────────────────────
-  // Определяем период сессии — из него берём месяц и год, а НЕ из today
-  const sessPeriod = sess.period; // напр. "Июнь 2026"
-  const MONTH_NAMES = ['Январь','Февраль','Март','Апрель','Май','Июнь',
-                        'Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
-  const pmatch = sessPeriod.match(/^(\S+)\s+(\d{4})$/);
-  const sessMonthIdx = pmatch ? MONTH_NAMES.indexOf(pmatch[1]) : -1; // 0-based
-  const sessYear     = pmatch ? parseInt(pmatch[2]) : new Date().getFullYear();
-  const now          = new Date();
-  const isCurrentPeriod = sessMonthIdx >= 0
-    && now.getFullYear() === sessYear
-    && now.getMonth()    === sessMonthIdx; // совпадает ли месяц сессии с текущим
-  const isPastPeriod   = sessMonthIdx >= 0 && (
-    sessYear < now.getFullYear() ||
-    (sessYear === now.getFullYear() && sessMonthIdx < now.getMonth())
-  );
-  const daysInMonth  = sessMonthIdx >= 0
-    ? new Date(sessYear, sessMonthIdx+1, 0).getDate()
-    : 30;
-  const dayOfMonth   = isCurrentPeriod ? now.getDate() : daysInMonth;
-  const expectedPct  = dayOfMonth / daysInMonth * 100;
-  const factForPace  = compRev > 0 ? compRev : n(T.revenue);
+  // ── Pace — темп выполнения плана с учётом даты ───────────────────
+  // Дата/ожидание считает общая computePace() (см. её определение — дословный
+  // аналог backend/analytics/pace.py::compute_pace, числа обязаны совпадать
+  // между Обзором/Менеджером/Сравнением/Командным центром). Здесь оставлена
+  // только сборка ЭТОГО конкретного визуала (карточки/цвета/бейджи) — сама
+  // логика "какой сегодня день, что ожидалось" больше не дублируется.
+  const sessPeriod  = sess.period; // напр. "Июнь 2026"
+  const factForPace = compRev > 0 ? compRev : n(T.revenue);
+  const pace        = computePace(sessPeriod, periodPlan, factForPace);
+  const isCurrentPeriod = pace ? pace.isCurrentPeriod : false;
+  const isPastPeriod    = pace ? pace.isPastPeriod : false;
+  const daysInMonth  = pace ? pace.daysInMonth : 30;
+  const dayOfMonth   = pace ? pace.dayOfMonth : 30;
+  const expectedPct  = pace ? pace.expectedPct : 0;
   // Pace показываем только для текущего периода
   // Для прошлых — показываем итоговый % выполнения плана
   if(periodPlan > 0 && factForPace > 0) {
-    const factPct  = factForPace / periodPlan * 100;
+    const factPct  = pace ? pace.actualPct : (factForPace / periodPlan * 100);
     const factLabel= compRevSource==='manual' ? 'Общая выручка' : compRevSource==='invoices' ? 'Общая выручка (накладные)' : 'Выручка рекламы';
     const color    = factPct >= 100 ? 'var(--green-m)' : factPct >= 80 ? 'var(--amber-m)' : 'var(--red-m)';
     const badge    = factPct >= 100 ? 'bg' : factPct >= 80 ? 'bw' : 'bb';
@@ -6144,26 +6174,42 @@ function renderMgr(){
   const mgrReturnsCount = mgrInvBreak ? mgrInvBreak.returnsCount : 0;
   const mgrHeroValue = (mgrReturns>0 && mgrGross!=null) ? mgrGross : mgrRevenue;
   const mgrPlanPct = mgrPlan && mgrRevenue ? mgrRevenue/mgrPlan*100 : null;
+  // Pace — при «Все периоды» mgrRevenue уже сумма по нескольким месяцам, темп для
+  // такой суммы не определён (нет единого "дня месяца"), поэтому только для
+  // одного конкретного периода — см. computePace().
+  const mgrPace = (period !== 'all') ? computePace(period, mgrPlan, mgrRevenue) : null;
   const mgrPlanEl = document.getElementById('mgr-plan-bar');
   if(mgrPlanEl){
     if(mgrPlan > 0){
       const pct = Math.min(mgrPlanPct||0, 100);
-      const col = (mgrPlanPct||0)>=100?'var(--green-m)':(mgrPlanPct||0)>=70?'var(--amber-m)':'var(--red-m)';
+      // Цвет/бейдж: если есть pace за ТЕКУЩИЙ период — красим по отставанию от графика
+      // (иначе почти весь месяц горело бы жёлтым/красным просто потому что 100% плана
+      // физически недостижимо раньше конца месяца). Для прошлых периодов и «Все периоды»
+      // pace недоступен — остаётся прежняя грубая логика по факту/план целиком.
+      const useCol = (mgrPace && mgrPace.isCurrentPeriod)
+        ? (mgrPace.onPace ? 'var(--green-m)' : mgrPace.gapPct<=-20 ? 'var(--red-m)' : 'var(--amber-m)')
+        : ((mgrPlanPct||0)>=100?'var(--green-m)':(mgrPlanPct||0)>=70?'var(--amber-m)':'var(--red-m)');
       const badgeCls = (mgrPlanPct||0)>=100?'bg':(mgrPlanPct||0)>=70?'bw':'bb';
       const factLbl = mgrRevIsInvoice ? ('Факт (накладные)' + (mgrReturns>0 ? ' (чисто)' : '')) : 'Факт (реклама)';
       const warnRow = mgrRevIsInvoice ? '' :
         '<div style="font-size:10px;color:var(--amber-m);margin-top:8px;padding:6px 10px;background:var(--amber-l);border-radius:6px">⚠️ Нет накладных за этот срез — показана только рекламная выручка, реальные продажи могут быть больше</div>';
+      const paceRow = (mgrPace && mgrPace.isCurrentPeriod) ?
+        '<div style="font-size:11px;margin-top:8px;color:'+(mgrPace.onPace?'var(--green-m)':'var(--amber-m)')+'">' +
+        '⏱ '+mgrPace.dayOfMonth+'-й день из '+mgrPace.daysInMonth+': ожидалось ~'+mgrPace.expectedPct.toFixed(0)+'% '+
+        '('+new Intl.NumberFormat("ru-RU").format(Math.round(mgrPace.expectedRevenue))+' ₸) — '+
+        (mgrPace.onPace ? 'в графике или опережаем' : 'отстаём от графика на '+new Intl.NumberFormat("ru-RU").format(Math.round(-mgrPace.gapRevenue))+' ₸') +
+        '</div>' : '';
       mgrPlanEl.innerHTML =
-        '<div class="card" style="margin-bottom:14px;border-left:4px solid '+col+'">' +
+        '<div class="card" style="margin-bottom:14px;border-left:4px solid '+useCol+'">' +
         '<div class="card-head"><div class="card-title">📊 Выполнение плана — '+mgr.name+'</div>' +
         '<span class="badge '+badgeCls+'">'+(mgrPlanPct||0).toFixed(1)+'%</span></div>' +
         '<div class="pbar-track" style="height:10px;margin:8px 0;border-radius:5px">' +
-        '<div class="pbar-fill" style="width:'+pct+'%;background:'+col+';border-radius:5px;transition:.3s"></div></div>' +
+        '<div class="pbar-fill" style="width:'+pct+'%;background:'+useCol+';border-radius:5px;transition:.3s"></div></div>' +
         '<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)">' +
         '<span>'+factLbl+': <b style="color:var(--ink)">'+new Intl.NumberFormat("ru-RU").format(Math.round(mgrRevenue))+' ₸</b></span>' +
         '<span>План: <b style="color:var(--ink)">'+new Intl.NumberFormat("ru-RU").format(mgrPlan)+' ₸</b></span>' +
-        '<span style="color:'+col+'">Осталось: <b>'+new Intl.NumberFormat("ru-RU").format(Math.max(0,Math.round(mgrPlan-mgrRevenue)))+' ₸</b></span>' +
-        '</div>' + warnRow + '</div>';
+        '<span style="color:'+useCol+'">Осталось: <b>'+new Intl.NumberFormat("ru-RU").format(Math.max(0,Math.round(mgrPlan-mgrRevenue)))+' ₸</b></span>' +
+        '</div>' + paceRow + warnRow + '</div>';
     } else {
       mgrPlanEl.innerHTML = '';  // план не задан — просто пусто
     }
@@ -6536,6 +6582,10 @@ function computeDeptMgrAnalysis(period){
       hasLostDetail,lostConfirmed,inProgress,
       lostDisplay:hasLostDetail?(lostConfirmed||0):slitted,
       plan:mgrPlan,planPct:mgrPlan&&totalRevenue?totalRevenue/mgrPlan*100:null,
+      // pace — только для одного конкретного периода: при «Все периоды» с несколькими
+      // месяцами (isMulti) totalRevenue уже сумма по ним, единого "дня месяца" для такой
+      // суммы не существует (см. тот же принцип в renderMgr/renderOverview).
+      pace:isMulti?null:computePace(periodLabel,mgrPlan,totalRevenue),
       srcMap,rows
     };
   });
@@ -6703,7 +6753,7 @@ function renderCompare(){
         <div style="font-size:10px;color:var(--muted);display:flex;gap:10px;flex-wrap:wrap">
           <span title="Конверсия">⚡ ${m.conv!==null?m.conv.toFixed(1)+'%':'—'}</span>
           <span title="Сделок закрыто">📦 ${m.deals}шт</span>
-          ${m.plan>0?`<span title="% выполнения плана" style="color:${(m.planPct||0)>=100?'var(--green-m)':(m.planPct||0)>=70?'var(--amber-m)':'var(--red-m)'}">🎯 ${(m.planPct||0).toFixed(0)}% плана</span>`:''}
+          ${m.plan>0?`<span title="${m.pace&&m.pace.isCurrentPeriod?`${m.pace.dayOfMonth}-й день из ${m.pace.daysInMonth}, ожидалось ~${m.pace.expectedPct.toFixed(0)}%`:'% выполнения плана'}" style="color:${m.pace&&m.pace.isCurrentPeriod?(m.pace.onPace?'var(--green-m)':m.pace.gapPct<=-20?'var(--red-m)':'var(--amber-m)'):((m.planPct||0)>=100?'var(--green-m)':(m.planPct||0)>=70?'var(--amber-m)':'var(--red-m)')}">🎯 ${(m.planPct||0).toFixed(0)}% плана${m.pace&&m.pace.isCurrentPeriod?` (ожид. ~${m.pace.expectedPct.toFixed(0)}%)`:''}</span>`:''}
           ${risk>0?`<span style="color:var(--red-m)" title="Оценка по рекламной воронке: сколько бы дополнительно заработал(а) по рекламе, если бы конверсия была на уровне среднего по отделу. Не зависит от накладных — считается только по лидам/конверсии. Не путать со стоимостью слитых лидов ниже (это реальные затраты на рекламу).">🚨 потери по конверсии (реклама) −${fmtM(risk)}</span>`:''}
         </div>
       </div>
@@ -6743,7 +6793,15 @@ function renderCompare(){
       const sev = Math.abs(a.leadSkewPct)>=60 ? 'high' : 'mid';
       items.push({sev, text:`${a.leadSkewPct>0?'+':''}${a.leadSkewPct.toFixed(0)}% лидов vs равное распределение`});
     }
-    if(m.plan>0 && (m.planPct||0)<70){
+    // Раньше — статичный порог planPct<70, из-за чего почти любой менеджер попадал
+    // в сигналы почти весь месяц (100% плана недостижимо раньше конца месяца). Теперь
+    // сравниваем с ожиданием НА СЕГОДНЯ (computePace, см. m.pace в computeDeptMgrAnalysis) —
+    // сигнал только если реально отстаём от графика, а не от финиша месяца.
+    if(m.plan>0 && m.pace && m.pace.isCurrentPeriod && m.pace.gapPct<=-5){
+      const sev = m.pace.gapPct<=-20 ? 'high' : 'mid';
+      items.push({sev, text:`план: ${(m.planPct||0).toFixed(0)}% при ожидаемых ~${m.pace.expectedPct.toFixed(0)}% на ${m.pace.dayOfMonth}-й день месяца`});
+    } else if(m.plan>0 && !m.pace && (m.planPct||0)<70){
+      // pace недоступен (прошлый период / «Все периоды») — прежняя грубая логика как fallback
       const sev = (m.planPct||0)<50 ? 'high' : 'mid';
       items.push({sev, text:`план (по общей сумме продаж) выполнен всего на ${(m.planPct||0).toFixed(0)}%`});
     }
@@ -6827,7 +6885,14 @@ function renderCompare(){
       </tr></thead>
       <tbody>${tblRows.map((m,i)=>{
         const convCol=m.conv!==null&&m.conv<=100?(m.conv>=cfg.cg?'var(--green-m)':m.conv>=cfg.cm?'var(--amber-m)':'var(--red-m)'):'inherit';
-        const planCol=m.planPct===null?'inherit':m.planPct>=100?'var(--green-m)':m.planPct>=70?'var(--amber-m)':'var(--red-m)';
+        // Раньше цвет колонки «% плана» был статичным порогом (100%/70%) — почти весь
+        // месяц горел жёлтым/красным, потому что 100% плана физически недостижимо
+        // раньше конца месяца. Если есть pace за текущий период — красим по отставанию
+        // от графика (computePace, m.pace из computeDeptMgrAnalysis), иначе (прошлый
+        // период / «Все периоды») — прежняя грубая логика.
+        const planCol=m.planPct===null?'inherit'
+          :(m.pace&&m.pace.isCurrentPeriod)?(m.pace.onPace?'var(--green-m)':m.pace.gapPct<=-20?'var(--red-m)':'var(--amber-m)')
+          :m.planPct>=100?'var(--green-m)':m.planPct>=70?'var(--amber-m)':'var(--red-m)';
         const riskCol=m.gapRevenue>0?'var(--red-m)':'var(--muted)';
         return `<tr>
           <td style="font-weight:800;color:${m.color}">${i+1}</td>
@@ -6857,7 +6922,7 @@ function renderCompare(){
           <td class="r">${fmtM(m.avgCheck)}</td>
           <td class="r" style="color:${m.lostDisplay>30?'var(--red-m)':'inherit'}" title="${m.hasLostDetail?(m.inProgress>0?`+${fmt(m.inProgress)} ещё в работе — это не потеря`:'все закрытые лиды либо куплены, либо точно проиграны'):'период без детализации CRM — грубая оценка (лиды минус продажи)'}">${fmt(m.lostDisplay)}${m.hasLostDetail&&m.inProgress>0?` <span style="opacity:.55;font-size:10px">+${fmt(m.inProgress)}</span>`:''}</td>
           <td class="r" style="color:var(--muted)">${m.pctRep?m.pctRep.toFixed(1)+'%':'—'}</td>
-          <td class="r" style="font-weight:700;color:${planCol}">${m.planPct!==null?m.planPct.toFixed(0)+'%':'—'}</td>
+          <td class="r" style="font-weight:700;color:${planCol}" title="${m.pace&&m.pace.isCurrentPeriod?`${m.pace.dayOfMonth}-й день из ${m.pace.daysInMonth}, ожидалось ~${m.pace.expectedPct.toFixed(0)}%`:''}">${m.planPct!==null?m.planPct.toFixed(0)+'%':'—'}${m.pace&&m.pace.isCurrentPeriod?`<br><span style="font-size:9px;font-weight:400;color:var(--muted)">ожид. ~${m.pace.expectedPct.toFixed(0)}%</span>`:''}</td>
           <td class="r" style="font-weight:700;color:${riskCol}">${m.gapRevenue>0?'−'+fmtM(m.gapRevenue):'—'}</td>
         </tr>`;
       }).join('')}</tbody>
@@ -8510,8 +8575,11 @@ function tcRenderBoard(){
 // Шаблон одной карточки — вызывается в цикле .map(), разметка не копируется
 // вручную под каждого менеджера.
 function tcCardTemplate(m){
+  // m.pace приходит с бэкенда (managers_leaderboard → team_center._manager_raw →
+  // analytics/pace.py) — темп относительно ожидания на сегодняшнюю дату, а не
+  // грубый "план выполнен на X%" без контекста, где мы сейчас в месяце.
   const planLbl = m.planPct!==null && m.planPct!==undefined
-    ? 'план '+m.planPct.toFixed(0)+'%'
+    ? 'план '+m.planPct.toFixed(0)+'%'+(m.pace&&m.pace.isCurrentPeriod?` (ожид. ~${m.pace.expectedPct.toFixed(0)}%)`:'')
     : 'план не задан';
   const hasDelta = m.revDeltaPct !== null && m.revDeltaPct !== undefined;
   const deltaCls = hasDelta ? (m.revDeltaPct >= 0 ? 'pos' : 'neg') : '';
@@ -8749,7 +8817,7 @@ function tcDossierTemplate(d, managerId, teamAvg){
       <div class="tc-tile">
         <div class="tc-tile-lbl">План</div>
         <div class="tc-tile-val">${k.planPct!==null && k.planPct!==undefined ? k.planPct.toFixed(0)+'%' : 'не задан'}</div>
-        <div class="tc-tile-delta ${k.planPct!==null && k.planPct!==undefined ? (k.planPct>=90?'pos':'neg') : ''}">${k.planPct!==null && k.planPct!==undefined ? (k.planPct>=90?'в графике':'под угрозой') : ''}</div>
+        <div class="tc-tile-delta ${k.pace&&k.pace.isCurrentPeriod ? (k.pace.onPace?'pos':'neg') : (k.planPct!==null && k.planPct!==undefined ? (k.planPct>=90?'pos':'neg') : '')}">${k.pace&&k.pace.isCurrentPeriod ? `${k.pace.dayOfMonth}/${k.pace.daysInMonth} дн., ожид. ~${k.pace.expectedPct.toFixed(0)}%` : (k.planPct!==null && k.planPct!==undefined ? (k.planPct>=90?'в графике':'под угрозой') : '')}</div>
       </div>
     </div>
     <div class="tc-panel" style="margin-bottom:16px">

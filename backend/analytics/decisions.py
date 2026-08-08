@@ -77,14 +77,24 @@ async def _rule_suspended(db: AsyncSession, signal_type: str) -> Optional[dict]:
 #    что уже посчитал team_center._status_and_reason) ───────────────────────
 
 def _money_impact_and_signal(m: dict) -> tuple[float, str, str]:
-    """Возвращает (money_impact, signal_type, basis) — basis для narrative."""
+    """Возвращает (money_impact, signal_type, basis) — basis для narrative.
+
+    plan_shortfall — раньше это была "план минус факт целиком" (недобор до
+    ФИНИША месяца), из-за чего почти всегда получалась крупная сумма уже на
+    3-4 день месяца — материальность (MATERIALITY_MIN_TENGE) пробивалась
+    почти каждый раз, и «Сегодня» заваливало решениями, которые к реальному
+    темпу не имели отношения (см. compute_pace / _status_and_reason). Теперь
+    это недобор ОТ ГРАФИКА — сколько не хватает до того, что должно быть
+    сделано на сегодняшнюю дату, а не до финиша месяца."""
     plan = m.get("plan") or 0
-    plan_pct = m.get("planPct")
     total_rev = m.get("totalRevenue") or 0
     gap_revenue = m.get("gapRevenue") or 0
+    pace = m.get("pace")
 
-    plan_shortfall = (plan - total_rev) if (plan and plan_pct is not None and plan_pct < 100) else 0
-    plan_shortfall = max(0.0, plan_shortfall)
+    if pace is not None and pace["gapPct"] < 0:
+        plan_shortfall = max(0.0, -pace["gapRevenue"])
+    else:
+        plan_shortfall = 0.0
 
     candidates = [
         ("plan_shortfall", plan_shortfall),
@@ -107,7 +117,11 @@ def _money_impact_and_signal(m: dict) -> tuple[float, str, str]:
 
     signal_type, money_impact = max(candidates, key=lambda c: c[1])
     basis = {
-        "plan_shortfall": f"недобор до плана {plan:,.0f} ₸".replace(",", " "),
+        "plan_shortfall": (
+            f"отставание от графика плана (ожидание на сегодня {pace['expectedRevenue']:,.0f} ₸ "
+            f"из {plan:,.0f} ₸ плана)".replace(",", " ")
+            if pace is not None else f"недобор до плана {plan:,.0f} ₸".replace(",", " ")
+        ),
         "conversion_gap": "разрыв конверсии к среднему по отделу",
         "data_anomaly": "аномалия по источнику",
     }[signal_type]
@@ -139,18 +153,45 @@ def _build_narrative(m: dict, signal_type: str, ctx_avg_conv: float, prior_attem
 
     elif signal_type == "plan_shortfall":
         plan_pct = m.get("planPct") or 0
-        versions.append({
-            "text": "Это временный провал одного периода, план обычно закрывается позже в месяце",
-            "status": "ruled_out" if plan_pct < 70 else "not_checked",
-        })
-        versions.append({
-            "text": f"Выполнение плана {plan_pct:.0f}% — отставание от графика подтверждено по факту накладных/рекламы",
-            "status": "confirmed",
-        })
-        noticed = f"{m['name']}: план выполнен на {plan_pct:.0f}%"
+        pace = m.get("pace")
+        if pace is not None:
+            # Раньше "версия A" (это просто разбег в начале месяца) отклонялась
+            # по статичному порогу plan_pct<70 — который не знал, какой сегодня
+            # день. Теперь это реально ПРОВЕРЕНО через compute_pace: до этой
+            # ветки решение доходит только если pace уже подтвердил отставание
+            # ОТ ГРАФИКА (см. team_center._status_and_reason: plan_risk/plan_watch),
+            # а не от финиша месяца — значит версия "это нормально для этой даты"
+            # уже опровергнута самим фактом, что мы здесь.
+            versions.append({
+                "text": (f"На {pace['dayOfMonth']}-й день месяца из {pace['daysInMonth']} "
+                          f"это мог быть просто обычный разбег, а не реальное отставание"),
+                "status": "ruled_out",
+            })
+            versions.append({
+                "text": (f"На сегодня ({pace['dayOfMonth']}/{pace['daysInMonth']} дней месяца) ожидалось "
+                          f"~{pace['expectedPct']:.0f}% плана ({pace['expectedRevenue']:,.0f} ₸) — по факту "
+                          f"{plan_pct:.0f}% — отставание от графика {-pace['gapRevenue']:,.0f} ₸"
+                          ).replace(",", " "),
+                "status": "confirmed",
+            })
+            noticed = f"{m['name']}: план {plan_pct:.0f}% при ожидаемых ~{pace['expectedPct']:.0f}% на сегодня"
+            proposed = "Проверить темп по неделям и причину отставания — источник лидов, загрузка менеджера или сезонность"
+            expected = f"Темп выравнивается минимум до ожидаемых на сегодня ~{pace['expectedPct']:.0f}% к концу окна проверки"
+        else:
+            # План есть, но период будущий/не парсится — pace недоступен
+            # (см. analytics/pace.py) — старый грубый текст как fallback.
+            versions.append({
+                "text": "Это временный провал одного периода, план обычно закрывается позже в месяце",
+                "status": "not_checked",
+            })
+            versions.append({
+                "text": f"Выполнение плана {plan_pct:.0f}%",
+                "status": "confirmed",
+            })
+            noticed = f"{m['name']}: план выполнен на {plan_pct:.0f}%"
+            proposed = "Проверить темп по неделям и причину отставания — источник лидов, загрузка менеджера или сезонность"
+            expected = "Темп выравнивается до ≥90% выполнения плана к концу окна проверки"
         proof = m.get("statusReason") or noticed
-        proposed = "Проверить темп по неделям и причину отставания — источник лидов, загрузка менеджера или сезонность"
-        expected = "Темп выравнивается до ≥90% выполнения плана к концу окна проверки"
 
     else:  # data_anomaly
         danger = [a for a in (m.get("anomalies") or []) if a.get("cls") == "danger"]

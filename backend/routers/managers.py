@@ -130,6 +130,7 @@ async def managers_leaderboard(period: str, db: AsyncSession = Depends(get_db)):
             "avgCheckDeltaPct": m["avgCheckDeltaPct"],
             "plan": m["plan"],
             "planPct": m["planPct"],
+            "pace": m.get("pace"),
             "spark": [h["revenue"] for h in history],
         })
 
@@ -216,6 +217,7 @@ async def manager_dossier(manager_id: str, period: str, db: AsyncSession = Depen
             "avgCheckDeltaPct": m["avgCheckDeltaPct"],
             "plan": m["plan"],
             "planPct": m["planPct"],
+            "pace": m.get("pace"),
         },
         "history": history,
         "strengths": good,

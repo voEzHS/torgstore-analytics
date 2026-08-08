@@ -37,6 +37,7 @@ from backend.models.models import (
     Manager, Session, SessionTotals, InvoiceStats, PeriodTarget, AnalyticsCache,
 )
 from backend.routers.imports import parse_period, DEPT_MANAGER_ID
+from backend.analytics.pace import compute_pace
 
 MONTH_NAMES_RU = {
     1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
@@ -148,6 +149,10 @@ async def _manager_raw(db: AsyncSession, mgr: Manager, period: str) -> Optional[
 
     plan = await _mgr_plan(db, mgr.id, period)
     plan_pct = (total_revenue / plan * 100) if plan else None
+    # pace — темп выполнения плана с учётом даты (см. analytics/pace.py). None,
+    # если плана нет или период будущий — тогда status/decisions используют
+    # planPct как и раньше (см. _status_and_reason).
+    pace = compute_pace(period, plan, total_revenue)
 
     cache = await _analytics_cache(db, sess.id)
     grouped = (cache.grouped_sources if cache else None) or []
@@ -168,6 +173,7 @@ async def _manager_raw(db: AsyncSession, mgr: Manager, period: str) -> Optional[
         "totalRevenue": total_revenue,
         "plan": plan,
         "planPct": plan_pct,
+        "pace": pace,
         "grouped": grouped,
         "anomalies": anomalies,
         "insights": insights,
@@ -273,7 +279,7 @@ def _apply_composite(managers_raw: list[dict], ctx: dict) -> None:
 
 def _status_and_reason(m: dict, conv_prev: Optional[float], leads_prev: Optional[float]) -> tuple[str, str]:
     conv_now = m["conv"]
-    plan_pct = m["planPct"]
+    pace = m.get("pace")  # None — план не задан / период будущий, см. analytics/pace.py
     anomalies = m["anomalies"] or []
     has_danger = any(a.get("cls") == "danger" for a in anomalies)
     has_any_anomaly = len(anomalies) > 0
@@ -286,13 +292,24 @@ def _status_and_reason(m: dict, conv_prev: Optional[float], leads_prev: Optional
     if leads_prev is not None and leads_prev > 0 and m["leads"] is not None:
         steady_volume = m["leads"] >= leads_prev * 0.85  # объём лидов не просел одновременно
 
+    # План: раньше здесь были статичные пороги (plan_pct<70 → risk, <100 → watch),
+    # из-за чего почти ЛЮБОЙ менеджер был "watch" почти ВЕСЬ месяц — 100% плана
+    # физически недостижимо раньше последних дней месяца, поэтому статус по плану
+    # был не сигналом, а фоновым шумом (см. compute_pace — 08.08.2026, разбор
+    # пользователя: "выгрузка и подстановление данных должны учитывать дату").
+    # Теперь сравниваем факт не с планом целиком, а с тем, сколько должно быть
+    # сделано НА СЕГОДНЯШНЮЮ дату (pace["gapPct"]) — отставание от графика, а не
+    # от финиша, к которому ещё не время подходить.
+    plan_risk = pace is not None and pace["gapPct"] <= -20
+    plan_watch = pace is not None and pace["gapPct"] <= -5  # вне допуска onPace
+
     is_risk = (
-        (plan_pct is not None and plan_pct < 70)
+        plan_risk
         or (conv_delta_pp is not None and conv_delta_pp <= -5)
         or has_danger
     )
     is_watch = (
-        (plan_pct is not None and plan_pct < 100)
+        plan_watch
         or (conv_delta_pp is not None and conv_delta_pp < 0)
         or has_any_anomaly
     )
@@ -309,13 +326,15 @@ def _status_and_reason(m: dict, conv_prev: Optional[float], leads_prev: Optional
         reason = f"конверсия просела на {abs(conv_delta_pp):.1f} п.п. при сохранении объёма лидов — стоит разобраться в причинах"
     elif conv_delta_pp is not None and conv_delta_pp <= -5:
         reason = f"конверсия просела на {abs(conv_delta_pp):.1f} п.п. к прошлому периоду"
-    elif plan_pct is not None and plan_pct < 70:
-        reason = f"выполнение плана {plan_pct:.0f}% — заметно отстаёт от графика"
+    elif plan_risk:
+        reason = (f"план: {pace['actualPct']:.0f}% при ожидаемых ~{pace['expectedPct']:.0f}% "
+                   f"на {pace['dayOfMonth']}-й день месяца — заметно отстаёт от графика")
     elif has_danger:
         danger_msgs = [a.get("msg") for a in anomalies if a.get("cls") == "danger" and a.get("msg")]
         reason = danger_msgs[0] if danger_msgs else "обнаружена аномалия в данных по источникам"
-    elif plan_pct is not None and plan_pct < 100:
-        reason = f"план выполнен на {plan_pct:.0f}% — пока не дотянуто"
+    elif plan_watch:
+        reason = (f"план: {pace['actualPct']:.0f}% при ожидаемых ~{pace['expectedPct']:.0f}% "
+                   f"на {pace['dayOfMonth']}-й день месяца — чуть отстаёт от графика")
     elif conv_delta_pp is not None and conv_delta_pp < 0:
         reason = f"конверсия немного снизилась ({conv_delta_pp:+.1f} п.п.) к прошлому периоду"
     elif has_any_anomaly:
@@ -484,11 +503,22 @@ def build_strengths_and_growth(m: dict, ctx_avg_conv: float, dept_avg_check: flo
     elif dept_avg_check and m["avgCheck"] and m["avgCheck"] > dept_avg_check * 1.1:
         good.append(f"Средний чек стабильно выше среднего по отделу")
 
-    if m.get("planPct") is not None:
-        if m["planPct"] >= 100:
-            good.append(f"План выполнен на {m['planPct']:.0f}%")
-        elif m["planPct"] < 70:
-            bad.append(f"Выполнение плана {m['planPct']:.0f}% — под угрозой месячная норма")
+    pace = m.get("pace")
+    if m.get("planPct") is not None and m["planPct"] >= 100:
+        good.append(f"План выполнен на {m['planPct']:.0f}%")
+    elif pace is not None:
+        # Pace-aware: сравниваем с ожиданием на сегодняшнюю дату, а не с планом
+        # целиком (см. compute_pace) — иначе "под угрозой" горело бы весь месяц.
+        if pace["gapPct"] >= 0:
+            good.append(
+                f"Опережает график по плану: {pace['actualPct']:.0f}% при ожидаемых "
+                f"~{pace['expectedPct']:.0f}% на сегодня"
+            )
+        elif pace["gapPct"] <= -20:
+            bad.append(
+                f"Заметно отстаёт от графика по плану: {pace['actualPct']:.0f}% при "
+                f"ожидаемых ~{pace['expectedPct']:.0f}% на сегодня"
+            )
 
     if not good:
         good.append("Стабильная работа без явных провалов по ключевым метрикам")
