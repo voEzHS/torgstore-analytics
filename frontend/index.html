@@ -2619,10 +2619,8 @@ select.combo-native-hidden {
     </div>
   </div>
   <div class="sidebar-nav">
-    <div class="nav-section">Сегодня</div>
-    <button type="button" class="nav-item active" onclick="nav('today')" aria-current="page"><i class="ti ti-sparkles" aria-hidden="true"></i>Сегодня<span class="nav-dot" id="dot-today"></span></button>
     <div class="nav-section">Аналитика</div>
-    <button type="button" class="nav-item" onclick="nav('compare')"><i class="ti ti-scale" aria-hidden="true"></i>Сравнение<span class="nav-dot" id="dot-compare"></span></button>
+    <button type="button" class="nav-item active" onclick="nav('compare')" aria-current="page"><i class="ti ti-scale" aria-hidden="true"></i>Сравнение<span class="nav-dot" id="dot-compare"></span></button>
     <button type="button" class="nav-item" onclick="nav('teamcenter')"><i class="ti ti-trophy" aria-hidden="true"></i>Командный центр<span class="nav-dot" id="dot-teamcenter"></span></button>
     <button type="button" class="nav-item" onclick="nav('ask')"><i class="ti ti-apps" aria-hidden="true"></i>Отчёты<span class="nav-dot" id="dot-ask"></span></button>
     <div class="nav-section">Данные</div>
@@ -3221,7 +3219,7 @@ const apiPatch= (path, body)  => api('PATCH',  path, body);
 const apiDel  = (path)        => api('DELETE', path);
 
 // ── NAV ──────────────────────────────────────────────────────────
-const PAGES = ['today','compare','teamcenter','ask','upload','team','settings'];
+const PAGES = ['compare','teamcenter','ask','upload','team','settings'];
 function nav(p){
   // Закрываем досье менеджера при уходе со страницы — иначе оно могло бы
   // зависнуть открытым поверх другой вкладки (единое досье, см. openTcDossier).
@@ -3258,7 +3256,6 @@ function nav(p){
   if(p==='upload')   syncUploadPage();
   if(p==='team')     renderTeam();
   if(p==='settings'){ applyCfg(); syncSettingsPeriodsList(); renderPeriodsTable(); }
-  if(p==='today'){ renderToday(); }
   // Сравнение и Командный центр — прямые пункты навигации (вынесены по итогам
   // UX-разбора «Спросить»: это два самых частых направления, раньше прятались
   // за лишним кликом в общем меню). Логика рендера перенесена сюда буквально
@@ -3664,7 +3661,7 @@ async function boot() {
   initPersonCombo('ov-who');
   initPersonCombo('mgr-sel');
   renderAll();
-  nav('today');
+  nav('compare');
 }
 
 // Загрузить одну сессию полностью (аналитика + строки)
@@ -4087,7 +4084,7 @@ async function handleFiles(input) {
   syncUI();
   renderAll();
   setTimeout(async () => {
-    nav('today');
+    nav('compare');
     if (activeSessId) await generateAiReport(activeSessId);
   }, 800);
 }
@@ -4135,7 +4132,7 @@ async function handleFileSingle(input) {
     syncUI();
     renderAll();
     setTimeout(async () => {
-      nav('today');
+      nav('compare');
       if (activeSessId) await generateAiReport(activeSessId);
     }, 700);
   } catch(e) {
