@@ -465,6 +465,258 @@ year=2026
 Апсерт идёт по (manager_id, period) для сводки, категории/товары — по имени
 (чтобы не терять точечные правки, `product_overrides`, между перезаливами).
 
+### 2.5.1 Готовый скрипт v3 (автоматизация, DOM-driven) — найдено и проверено 10.08.2026
+
+Этот отчёт в CRM — **НЕ** простой GET/JSON-эндпоинт как `report/tree` (§1) или
+`total-sum-ajax` (§3.5). Это Laravel-страница с настоящей `<form>` (39
+фильтров), submit которой перехватывается клиентским JS и превращается в
+AJAX `POST https://torgstore.zymyran.com/service/analytics/products/sales/form-post`,
+обновляющий DOM на месте (без перехода страницы). Правильный способ
+автоматизации — управлять реальными полями формы и реальной кнопкой, а не
+пытаться руками собрать payload (вероятно Livewire/CSRF-подписанный, не
+воспроизводится напрямую).
+
+**Подтверждено эмпирически 10.08.2026:**
+- Смена `<select name="manager_id">` (`.value` + `dispatchEvent('change')`)
+  сама по себе **не порождает сетевой запрос** к zymyran.com (проверено через
+  `read_network_requests` с `clear:true` — после смены значения лог пуст).
+  Значит внутри цикла по менеджерам единственное действие, которое считается
+  «запросом к CRM» по правилу §0 — это клик по кнопке «Поиск». Именно перед
+  ним (и только перед ним) обязательна пауза ≥3с.
+- Единственный `<table>` на странице содержит на каждую строку 16 колонок:
+  индексы 0-9 — чистые «сырые» значения (SKU, Название, Категория, Продано,
+  Сумма, Документы, Остатки, Мин.кол-во, Код поставщика, дублирующее полное
+  описание), индексы 10-15 — те же данные, но в форматированном виде для
+  отображения («194 600 ₸», «1 шт» и т.п.) — их парсить не нужно, есть чистые
+  числа в 3-4.
+- Чекбокс `input[name="date_delivered[enabled]"]` + текстовое поле
+  `input[name="date_delivered[date]"]` (формат `MM/DD/YYYY - MM/DD/YYYY`)
+  задают производный диапазон дат — независимо от того, что выбрано в самой
+  форме по умолчанию.
+- Сопоставление менеджеров: `<select name="manager_id">` в ЭТОМ отчёте имеет
+  СВОЙ независимый набор числовых id (205 опций, вообще все сотрудники в
+  Zymyran, не только 18 активных менеджеров сайта) — id НЕ совпадают с id из
+  других отчётов (`shipment_point`/`total-sum-ajax` и т.п.). Сопоставлять
+  нужно **по точному имени**, свежо на каждый прогон (список сотрудников в
+  CRM может меняться), а не хардкодить id. 10.08.2026: 17 из 18 менеджеров
+  сайта нашлись точным совпадением имени; **Виолетта Воробьева в этом
+  отчёте отсутствует полностью** (не найдена даже частичным совпадением по
+  фамилии) — это не баг скрипта, а факт CRM-справочника на эту дату,
+  логировать как `managers_unmatched` и не считать ошибкой выполнения.
+
+**Архитектура выгрузки — два таба, как и для остальных источников:**
+Таб A = CRM (`.../products/sales`) — сбор данных построчно по менеджерам.
+Таб B = сайт (`torgstore-api.onrender.com`) — единственный, кто реально
+отправляет `POST /import/products-json` (прямой cross-origin fetch с таба
+CRM на сайт проверен 10.08.2026 и **не работает** — `TypeError: Failed to
+fetch` на защищённых Basic-Auth эндпоинтах, хотя `/health` без авторизации
+проходит; значит CORS/Basic-Auth-связка блокирует прямой межтабный запрос,
+и обходной путь — не нужен, раз уже есть рабочий паттерн с двумя табами).
+
+**Шаг 1 — на табе B (сайт), получить актуальный список менеджеров** (не CRM-запрос, не под правилом §0):
+```js
+const r = await fetch('/api/v1/managers');
+const j = await r.json();
+window.__siteMgrs = j.filter(m => m.id !== '00000000-0000-0000-0000-000000000001')
+                      .map(m => m.name);
+window.__siteMgrs.length;
+```
+
+**⚠️ Найдено живым прогоном 10.08.2026 — ДВЕ ловушки, обе исправлены ниже:**
+1. **CDP `Runtime.evaluate` обрывается на ~45с.** Полный цикл по 17
+   менеджерам занимает 1.5-4+ минуты (см. п.2) — то есть НЕЛЬЗЯ `await`-ить
+   весь цикл внутри одного вызова `javascript_tool`: он падает с ошибкой
+   `timed out after 45000ms`, хотя сам JS в странице при этом **продолжает
+   выполняться независимо** (это подтверждено — `window`-переменные после
+   такой ошибки продолжали обновляться). Проблема не в самом выполнении, а
+   в том, что вызывающий инструмент перестаёт ждать результат.
+   **Решение: fire-and-forget.** Вызов `javascript_tool` запускает цикл как
+   `(async () => {...})()` **без `await`** на верхнем уровне и сразу
+   возвращает `{started:true}` — весь долгий цикл живёт в странице сам по
+   себе. Прогресс/результат читаются отдельными короткими вызовами
+   `javascript_tool` (poll), см. Шаг 2b.
+2. **Фоновая (не активная) вкладка Chrome троттлит таймеры непредсказуемо.**
+   Живой тест 10.08.2026: вместо ожидаемых ~6с/менеджер реальный темп был
+   ~20-22с/менеджер, и на 7-м менеджере `document.querySelectorAll('table')[0]`
+   вернул `undefined` (таблица не успела перерендериться к моменту фиксированной
+   паузы). **Фиксированные `setTimeout`-паузы после клика ненадёжны** —
+   вместо них `extractOne` ниже опрашивает текст кнопки «Поиск» (у неё
+   есть строго различимое состояние загрузки — `textContent` содержит
+   «Подождите…» пока идёт AJAX) до готовности, с таймаутом и одним защитным
+   повтором клика, если таблица всё равно не появилась.
+
+```js
+const MONTH_NAMES = ['','Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+const today = new Date();
+const first = new Date(today.getFullYear(), today.getMonth(), 1);
+const fmt = d => String(d.getMonth()+1).padStart(2,'0') + '/' + String(d.getDate()).padStart(2,'0') + '/' + d.getFullYear();
+const dateRangeStr = fmt(first) + ' - ' + fmt(today);
+const monthName = MONTH_NAMES[today.getMonth()+1];
+const year = today.getFullYear();
+
+// подставить сюда реальный список из window.__siteMgrs (Шаг 1)
+const siteNames = [/* ...17-18 имён... */];
+
+function norm(s){ return s.replace(/\s+/g,' ').trim().toLowerCase(); }
+const sel = document.querySelector('select[name="manager_id"]');
+const opts = Array.from(sel.options).map(o => ({value:o.value, text:o.textContent.trim()}));
+const byNorm = {}; opts.forEach(o => byNorm[norm(o.text)] = o);
+const matched = [], unmatchedNames = [];
+for (const name of siteNames) {
+  const hit = byNorm[norm(name)];
+  if (hit) matched.push({name, crmId: hit.value}); else unmatchedNames.push(name);
+}
+
+const dateEnabled = document.querySelector('input[name="date_delivered[enabled]"]');
+const dateField = document.querySelector('input[name="date_delivered[date]"]');
+if (!dateEnabled.checked) { dateEnabled.checked = true; dateEnabled.dispatchEvent(new Event('change', {bubbles:true})); }
+dateField.value = dateRangeStr;
+dateField.dispatchEvent(new Event('change', {bubbles:true}));
+
+window.__productsProgress = 0;
+window.__productsTotal = matched.length;
+window.__productsUnmatched = unmatchedNames;
+window.__productsDone = false;
+window.__productsError = null;
+window.__productsClickTimestamps = [];
+window.__productsPayload = null;
+
+async function waitButtonIdle(btn, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!btn.textContent.includes('Подождите')) return true;
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return false;
+}
+
+// clickLog — общий массив, куда КАЖДЫЙ клик (включая повторные попытки) пишет свой timestamp,
+// чтобы самопроверка правила §0 покрывала реальные сетевые события, а не только успешные
+async function extractOne(crmId, clickLog, attempt) {
+  attempt = attempt || 1;
+  const s = document.querySelector('select[name="manager_id"]');
+  s.value = crmId;
+  s.dispatchEvent(new Event('change', {bubbles:true}));
+
+  // ПРАВИЛО §0: ≥3с ВСЕГДА перед единственным сетевым действием (клик) — без исключений, в том числе перед повтором
+  await new Promise(r => setTimeout(r, 3500));
+  const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim().startsWith('Поиск'));
+  clickLog.push(Date.now());
+  btn.click();
+  await new Promise(r => setTimeout(r, 400));           // дать «Подождите» успеть появиться в DOM
+  await waitButtonIdle(btn, 20000);                      // опрос вместо фиксированной паузы, до 20с
+  await new Promise(r => setTimeout(r, 300));             // небольшой запас — таблица иногда обновляется на кадр позже кнопки
+
+  const table = document.querySelectorAll('table')[0];
+  if (!table) {
+    if (attempt >= 2) throw new Error('Таблица не найдена после ' + attempt + ' попыток, crmId=' + crmId);
+    return extractOne(crmId, clickLog, attempt + 1);      // защитный повтор — свой собственный ≥3.5с перед клик ом уже гарантирован рекурсией
+  }
+  const rows = Array.from(table.querySelectorAll('tbody tr, tr')).slice(1)
+    .map(tr => Array.from(tr.querySelectorAll('td,th')).map(td => td.textContent.replace(/\s+/g,' ').trim()))
+    .filter(r => r.length >= 5 && r[0]);
+  return rows.map(r => ({ product_name: r[1], category: r[2], qty: Number(r[3])||0, revenue: Number(r[4])||0 }));
+}
+
+(async () => {
+  try {
+    const rowsOut = [];
+    for (const m of matched) {
+      const items = await extractOne(m.crmId, window.__productsClickTimestamps);
+
+      const itemMap = new Map();
+      for (const it of items) {
+        const key = it.product_name;
+        const cur = itemMap.get(key) || { product_name: it.product_name, category: it.category, qty: 0, revenue: 0 };
+        cur.qty += it.qty; cur.revenue += it.revenue;
+        itemMap.set(key, cur);
+      }
+      const itemsOut = Array.from(itemMap.values());
+
+      const catMap = new Map();
+      for (const it of itemsOut) {
+        const cur = catMap.get(it.category) || { category: it.category, qty: 0, revenue: 0 };
+        cur.qty += it.qty; cur.revenue += it.revenue;
+        catMap.set(it.category, cur);
+      }
+
+      rowsOut.push({
+        manager: m.name, month: monthName,
+        qty: itemsOut.reduce((s,i)=>s+i.qty,0),
+        revenue: itemsOut.reduce((s,i)=>s+i.revenue,0),
+        categories: Array.from(catMap.values()),
+        items: itemsOut,
+      });
+      window.__productsProgress++;
+    }
+
+    // САМОПРОВЕРКА правила §0 — обязательна, останавливаемся при нарушении
+    const gaps = window.__productsClickTimestamps.slice(1).map((t,i) => (t - window.__productsClickTimestamps[i]) / 1000);
+    if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
+
+    window.__productsPayload = { year, rows: rowsOut, source: 'crm-auto-' + today.toISOString().slice(0,10) };
+    window.__productsGaps = gaps;
+    window.__productsDone = true;
+  } catch (e) {
+    window.__productsError = String(e);
+    window.__productsDone = true;
+  }
+})();
+
+JSON.stringify({ started: true, totalManagers: matched.length, unmatchedNames });
+```
+
+**Шаг 2b — опрос прогресса** (отдельные короткие вызовы `javascript_tool`,
+каждые ~30-40с, пока `done` не станет `true`; полный прогон 17 менеджеров
+занимал в живом тесте от ~2 до ~6+ минут из-за троттлинга фоновой вкладки —
+это нормально, скорость не приоритет, важно не нарушить §0):
+```js
+JSON.stringify({
+  progress: window.__productsProgress, total: window.__productsTotal,
+  done: window.__productsDone, error: window.__productsError,
+  gaps: window.__productsGaps, payloadRows: window.__productsPayload ? window.__productsPayload.rows.length : null,
+});
+```
+Если `error` не `null` — прогон упал (например, после исчерпания повторов
+на отсутствующей таблице); почитать `error`, при необходимости `navigate()`
+на тот же URL для чистого состояния и запустить Шаг 2 заново с нуля (это
+не нарушает §0 — сама перезагрузка страницы такой же «один запрос», как
+описано в §0 «технические ограничения браузера»).
+
+**Шаг 3 — только после того, как Шаг 2b показал `done:true` и `error:null` —
+забрать полный payload без обрезки вывода** (стандартный обход лимита
+вывода `javascript_tool` для больших данных — см. §0 «технические
+ограничения браузера», такой же приём, что и для §1.6/§3.5):
+```js
+document.body.innerHTML = '<pre id="__dump"></pre>';
+document.getElementById('__dump').textContent = JSON.stringify(window.__productsPayload);
+'dumped, length=' + document.getElementById('__dump').textContent.length;
+```
+затем прочитать через `get_page_text` на этом же табе. ⚠️ Это уничтожает
+живой DOM страницы — после этого таб CRM для дальнейшей работы непригоден
+без `navigate()`-перезагрузки (это нормально, весь сбор данных на сегодня
+уже закончен на этом шаге).
+
+**Шаг 4 — на табе B (сайт), отправить итог:**
+```js
+const payload = /* JSON.parse(...) текста, полученного в Шаге 3 */;
+const r = await fetch('/api/v1/import/products-json', {
+  method: 'POST',
+  headers: {'Content-Type': 'application/json'},
+  body: JSON.stringify(payload),
+});
+const j = await r.json();
+JSON.stringify({status: r.status, ...j});
+```
+Проверить в ответе: `managers_unmatched` пуст (или содержит только заведомо
+известных отсутствующих, например Воробьеву), `summary_count`/`item_count`
+разумны по масштабу, `import_id` присутствует.
+
+**Итого сетевых запросов к zymyran.com за один прогон** = ровно N (по числу
+сопоставленных менеджеров, ~17), каждый отделён от предыдущего ≥3с явным
+`await` внутри Шага 2 — это единственная точка, где правило §0 применимо
+(смена select/date полей запросов не порождает, см. выше).
+
 ---
 
 ## 5. ✅ Чек-лист «актуализировать данные за период X» — ВСЕ источники сразу
@@ -478,11 +730,11 @@ year=2026
 1. **Сквозная аналитика (реклама/UTM)** — §1. `POST /import/tree-json`.
 2. **Накладные (касса/отгрузка)** — §2. `POST /invoices/import`.
 3. **Скидки (без учёта уценки)** — §3.5. `POST /discounts/import`.
-4. **Товарная аналитика** — §2.5. `POST /import/products`. Если период
-   неполный (месяц ещё не закончился) — либо выгрузить частично и явно
-   пометить как «частичный», либо явно предупредить пользователя, что для
-   этого источника «актуализация» откладывается до конца месяца — но не
-   пропускать молча.
+4. **Товарная аналитика** — §2.5. Ручной перезалив: `POST /import/products`
+   (Excel). Автоматический ежедневный: §2.5.1, `POST /import/products-json`
+   (DOM-скрипт, без файла) — тянет диапазон «1 число текущего месяца → сегодня»,
+   апсерт идемпотентен, частичный месяц НЕ проблема (перезаливается заново
+   каждый день по мере роста диапазона).
 5. **Планы продаж** — раздел «CRM → Планы продаж», см. сессию 07.08.2026
    (агрегация по всем каналам менеджера, не только по одному).
 6. **Причины отказа** — Лиды → Фильтр → «Причина Отказа», см. раздел про
