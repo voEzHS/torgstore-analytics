@@ -108,6 +108,7 @@ async def get_manager_discounts(manager_id: str, period: Optional[str] = None, d
             "discount_amount": float(r.discount_amount or 0),
             "discount_pct": float(r.discount_pct) if r.discount_pct is not None else None,
             "snapshot_at": r.snapshot_at.isoformat() if r.snapshot_at else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         }
         for r in rows
     ]
@@ -127,6 +128,7 @@ async def list_all_manager_discounts(period: Optional[str] = None, db: AsyncSess
             "sale_amount": float(r.sale_amount or 0),
             "discount_amount": float(r.discount_amount or 0),
             "discount_pct": float(r.discount_pct) if r.discount_pct is not None else None,
+            "updated_at": r.updated_at.isoformat() if r.updated_at else None,
         }
         for r, mgr in result.all()
     ]

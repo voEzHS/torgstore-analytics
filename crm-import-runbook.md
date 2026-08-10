@@ -15,68 +15,81 @@
 
 ---
 
-## 0. ⚠️ ОБЯЗАТЕЛЬНО ПЕРЕД ЛЮБЫМ ДЕЙСТВИЕМ В ЭТОЙ ВКЛАДКЕ — guard на rate-limit
+## 0. ⚠️ ОБЯЗАТЕЛЬНО ПЕРЕД ЛЮБЫМ ЗАПРОСОМ К CRM — правило 3 секунд
 
 26.07.2026 массовая выгрузка без паузы (~5 запросов/сек к zymyran.com) была
-расценена сотрудниками как атака — доступ заблокировали. Правило теперь
-жёсткое: **минимум 3 секунды между ЛЮБЫМИ запросами к torgstore.zymyran.com**,
-и оно не должно зависеть от того, помнит агент об этом в моменте или нет.
+расценена сотрудниками как атака — доступ заблокировали. Правило жёсткое:
+**минимум 3 секунды между ЛЮБЫМИ запросами к torgstore.zymyran.com**, и оно
+не должно зависеть от того, помнит агент об этом в моменте или нет.
 
-**Перед первым запросом к CRM в этой вкладке (и после каждого reload/новой
-навигации на zymyran.com — JS-состояние вкладки сбрасывается) вставить в
-консоль этот снипет:**
+### История двух проваленных попыток (важно прочитать перед тем, как трогать этот раздел)
+
+- **v1 (localStorage-guard, до 08.08.2026)** — перехватывал `window.fetch`/
+  `XMLHttpRequest`, проверял last-timestamp в localStorage. Имел race
+  condition при параллельных вызовах (`Promise.all`): 08.08.2026
+  автоматический прогон уложил 119 запросов (17 менеджеров × 7 складов) в
+  137 секунд вместо минимум ~357с — **реальное нарушение правила на проде**.
+- **v2 (promise-chain queue, 08.08.2026, тот же день)** — попытка исправить
+  v1 настоящей последовательной очередью. Прошла изолированный тест (без
+  реальных сетевых вызовов, все паузы ≥3.0с), но **ПРОВАЛИЛА живой тест
+  против настоящего CRM в тот же день**: guard был вооружён в одном вызове
+  `javascript_tool`, реальные запросы (`Promise.all` по 7 shipment_point,
+  manager_id=566) — в следующем отдельном вызове. Итог: все 7 запросов ушли
+  за 0.331 секунды (минимальный интервал 0.003с) вместо требуемых ≥18с.
+  Причина, предположительно — переопределение встроенных `window.fetch`/
+  `XMLHttpRequest` не переживает границу между отдельными вызовами
+  `javascript_tool` (в отличие от обычных именованных функций/свойств на
+  `window`, которые, по наблюдениям, переживают).
+
+**Вывод: перехват (monkey-patching) `window.fetch`/`XMLHttpRequest` признан
+НЕНАДЁЖНЫМ способом гарантировать паузу и БОЛЬШЕ НЕ используется нигде в
+этом документе.**
+
+### v3 (текущий, действующий метод) — явная пауза внутри самой функции запроса
+
+Вместо перехвата глобальных объектов — обычная функция с ЖЁСТКО зашитой
+паузой 3с ПЕРЕД КАЖДЫМ запросом, без исключений (в том числе перед первым
+запросом в новом вызове `javascript_tool`). Гарантия строится на голой
+JS-семантике `await`/`setTimeout` внутри одного выполнения скрипта — не
+зависит ни от какого состояния, которое должно "пережить" границу между
+вызовами инструмента:
 
 ```js
-// CRM rate-limit guard — переживает reload (localStorage, а не память вкладки).
-// Перехватывает fetch И XMLHttpRequest — то есть работает и для ручных fetch
-// (fetchCompact ниже), и для запросов, которые UI сам шлёт при клике/наведении
-// (например total-sum-ajax при смене фильтра на экране "Топ продаж").
-(function(){
-  const KEY='__crm_rl_last_ts', MIN_GAP=3000;
-  async function throttle(){
-    const last=Number(localStorage.getItem(KEY)||0), now=Date.now();
-    const wait=MIN_GAP-(now-last);
-    if(wait>0) await new Promise(r=>setTimeout(r,wait));
-    localStorage.setItem(KEY,String(Date.now()));
-  }
-  window.__crmThrottle = throttle;
-  const origFetch = window.fetch;
-  window.fetch = async function(input, init){
-    const url = typeof input==='string' ? input : (input && input.url) || '';
-    if(url.includes('zymyran.com')) await throttle();
-    return origFetch.call(this, input, init);
-  };
-  const OrigXHR = window.XMLHttpRequest;
-  function PatchedXHR(){
-    const xhr = new OrigXHR();
-    const origOpen = xhr.open;
-    xhr.open = function(method, url, ...rest){
-      this.__isCrm = String(url).includes('zymyran.com');
-      return origOpen.call(this, method, url, ...rest);
-    };
-    const origSend = xhr.send;
-    xhr.send = function(...args){
-      if(this.__isCrm){ throttle().then(()=>origSend.apply(this,args)); }
-      else { origSend.apply(this,args); }
-    };
-    return xhr;
-  }
-  window.XMLHttpRequest = PatchedXHR;
-  console.log('%c[CRM rate-limit guard armed] минимум 3с между запросами к zymyran.com, живёт до reload', 'color:#0a0;font-weight:bold');
-})();
+async function crmGet(url){
+  await new Promise(r => setTimeout(r, 3000)); // ВСЕГДА первым делом — без исключений, без пропуска первого запроса, без проверки "прошло ли уже 3с"
+  const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
+  return await r.json();
+}
 ```
 
-После этого `fetchCompact` (раздел 1.6) и любой клик по фильтрам/наведение на
-странице «Топ продаж» (раздел 2) автоматически проходят через паузу — ничего
-дополнительно помнить не нужно, пока не случится reload/навигация на новый URL
-внутри zymyran.com (тогда guard нужно вставить заново).
+**Правила использования — обязательны:**
+1. Все запросы к CRM идут ТОЛЬКО через `crmGet(url)`, никогда напрямую через
+   `fetch`.
+2. Только `for...of` с `await crmGet(...)` внутри цикла. **НИКОГДА**
+   `Promise.all`/`Promise.race`/`.map()` без последовательного await —
+   параллельный запуск сломает паузу даже в v3, потому что каждый вызов
+   независимо ждёт свои 3с и потом все fetch уходят почти одновременно.
+3. Функцию `crmGet` копировать целиком в НАЧАЛО каждого отдельного вызова
+   `javascript_tool`, где будут запросы к CRM — не полагаться на то, что она
+   уже определена из предыдущего вызова.
+4. В конце скрипта, который делает несколько запросов, — самопроверка:
+   ```js
+   // timestamps — массив Date.now(), записанный сразу после каждого crmGet
+   const gaps = timestamps.slice(1).map((t,i) => (t - timestamps[i]) / 1000);
+   if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
+   ```
+   Если самопроверка кидает ошибку — остановиться и сообщить пользователю,
+   а не продолжать выгрузку молча.
+
+**Живой тест 08.08.2026** (2 реальных запроса к `total-sum-ajax`, ОДИН вызов
+`javascript_tool`, без Promise.all): `totalSeconds=7.365`, `gap=3.743с` —
+подтверждено ≥3с против настоящего CRM. В отличие от v1/v2 гарантия здесь не
+зависит от того, пережило ли что-то границу между вызовами инструмента —
+функция самодостаточна на каждый отдельный вызов.
 
 Если это делает агент через браузерную автоматизацию (Claude in Chrome) —
-первым шагом при любом взаимодействии с вкладкой torgstore.zymyran.com всегда
-идёт вставка и выполнение этого снипета через `javascript_tool`, и только
-потом — навигация/клики/остальные fetch.
-
----
+первым действием в любом скрипте, который обращается к torgstore.zymyran.com,
+идёт определение `crmGet` (см. выше), и только потом сами запросы.
 
 ## 1. Сквозная аналитика (реклама/UTM) — основная выгрузка
 
@@ -316,10 +329,18 @@ discount_amount_чистый = totalSumWithoutDiscount(sp=0)  - Σ totalSumWitho
 баг/особенность CRM, найден 07.08.2026 при тестировании. **Обязательно ставить
 `date=other`**, чтобы `date_other=<ДД/ММ/ГГГГ - ДД/ММ/ГГГГ>` реально применился.
 
-### Готовый скрипт (консоль вкладки CRM, guard из §0 уже должен быть вставлен)
+### Готовый скрипт v3 (консоль вкладки CRM) — crmGet копировать целиком в начало КАЖДОГО отдельного вызова javascript_tool, см. §0
 
 ```js
 const UCENKA_IDS = [27, 29, 228, 236, 243, 577];
+
+// v3 — см. §0. НЕ полагается на перехват fetch/XHR (v1/v2 признаны ненадёжными).
+// Пауза 3с зашита прямо здесь, безусловно, перед КАЖДЫМ запросом.
+async function crmGet(url){
+  await new Promise(r => setTimeout(r, 3000));
+  const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
+  return await r.json();
+}
 
 // ⚠️ ОБЯЗАТЕЛЕН status_id[]=8 (Доставлено) — без него totalSum завышен почти
 // в 1.5 раза (сумма по ВСЕМ статусам, а не только по факту доставленных).
@@ -329,24 +350,32 @@ const UCENKA_IDS = [27, 29, 228, 236, 243, 577];
 async function totalSumRaw(crmManagerId, dateFrom, dateTo, shipmentPoint){
   const dr = encodeURIComponent(`${dateFrom} - ${dateTo}`); // формат ДД/ММ/ГГГГ
   const url = `/service/warehouse/products/requests/total-sum-ajax?search=&sortby=default&smart=&sku=&client_name=&type=any&date=other&date_other=${dr}&date_assembled=${dr}&date_completed=${dr}&date_delivered=${dr}&date_returned=${dr}&date_canceled=${dr}&date_debt=${dr}&invoice_sum_from=&invoice_sum_to=&client_id=&manager_id=${crmManagerId}&assembler_id=all&packager_id=all&courier_id=all&payments_method=0&discount_id=any&sale_channel=0&utm_source=0&utm_medium=&utm_campaign=&utm_term=&utm_content=&bill_id=0&service_point=0&shipment_point=${shipmentPoint}&return_warehouse=0&with_docs=all&promotion=all&via_source=0&page=0&path=/service/warehouse/products/requests&status_id[]=8`;
-  const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
-  const j = await r.json();
+  const j = await crmGet(url);
+  timestampsLog.push(Date.now()); // для самопроверки паузы после серии запросов
   const num = s => Number(String(s).replace(/[^\d.-]/g,'')) || 0;
   return { sale: num(j.totalSum), discount: num(j.totalSumWithoutDiscount) };
 }
 
+let timestampsLog = []; // сбрасывать перед каждым новым менеджером
+
 // Пример: Ерганат Аубакир (CRM id 566), Июль 2026
 async function discountClean(crmManagerId, dateFrom, dateTo){
+  timestampsLog = [];
   const all = await totalSumRaw(crmManagerId, dateFrom, dateTo, 0);
   let ucenkaSale = 0, ucenkaDiscount = 0;
   for (const id of UCENKA_IDS){
-    const u = await totalSumRaw(crmManagerId, dateFrom, dateTo, id); // throttle сам подождёт 3с
+    const u = await totalSumRaw(crmManagerId, dateFrom, dateTo, id); // for...of + await — НИКОГДА Promise.all
     ucenkaSale += u.sale; ucenkaDiscount += u.discount;
+  }
+  // Самопроверка ОБЯЗАТЕЛЬНА: если хоть один разрыв < 2.9с — бросаем ошибку и НЕ импортируем эти данные.
+  const gaps = timestampsLog.slice(1).map((t,i) => (t - timestampsLog[i]) / 1000);
+  if (!gaps.every(g => g >= 2.9)) {
+    throw new Error('RATE LIMIT VIOLATION for manager ' + crmManagerId + ': ' + JSON.stringify(gaps));
   }
   return {
     sale_amount: all.sale - ucenkaSale,
     discount_amount: all.discount - ucenkaDiscount,
-    _debug: { all, ucenkaSale, ucenkaDiscount }
+    _debug: { all, ucenkaSale, ucenkaDiscount, gaps }
   };
 }
 // await discountClean(566, '01/07/2026', '31/07/2026')
