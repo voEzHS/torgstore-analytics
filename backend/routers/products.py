@@ -3,6 +3,7 @@
 собранная из CRM Zymyran (Аналитика -> Товары, разрез по дате доставки).
 
 POST   /api/v1/import/products         — загрузка Excel (3 листа: По месяцам / По категориям / По товарам)
+POST   /api/v1/import/products-json    — JSON-эквивалент, для автоматической ежедневной выгрузки
 GET    /api/v1/products/{manager_id}   — данные для карточки менеджера (с применёнными правками)
 POST   /api/v1/products/override       — точечная правка значения (переживает повторный импорт)
 DELETE /api/v1/products/override/{id}  — снять правку, вернуться к импортированному значению
@@ -143,7 +144,6 @@ async def import_products(
                    "Лист «По месяцам» пуст или колонки названы иначе.",
         )
 
-    # --- Import batch ---
     imp = ProductImport(
         filename=file.filename,
         manager_count=len({mid for (mid, _period) in summaries.keys()}),
@@ -153,11 +153,36 @@ async def import_products(
     db.add(imp)
     await db.flush()
 
-    # --- Upsert по (manager_id, period); категории/товары апсертятся ПО ИМЕНИ, чтобы их id
-    #     оставался стабильным между загрузками — иначе точечные правки (product_overrides)
-    #     будут "отвязываться" от строки при каждом повторном импорте (CRM-данные могут
-    #     обновляться задним числом даже за прошлые месяцы). Строки, у которых есть активная
-    #     правка, но которых больше нет в свежей выгрузке, не удаляются — чтобы не терять правку.
+    await _upsert_products_data(db, imp.id, summaries, categories, items)
+    await db.commit()
+
+    matched_names = sorted({m.name for m in managers if m.id in {mid for (mid, _p) in summaries.keys()}})
+
+    return {
+        "import_id": str(imp.id),
+        "periods": sorted({p for (_m, p) in summaries.keys()}),
+        "managers_matched": matched_names,
+        "managers_unmatched": sorted(unmatched_names),
+        "summary_count": len(summaries),
+        "category_count": sum(len(v) for v in categories.values()),
+        "item_count": sum(len(v) for v in items.values()),
+        "message": f"Импортировано: {len(summaries)} пар менеджер/период."
+                   + (f" Не сопоставлены: {', '.join(sorted(unmatched_names))}." if unmatched_names else ""),
+    }
+
+
+async def _upsert_products_data(db: AsyncSession, import_id, summaries: dict, categories: dict, items: dict):
+    """
+    Общая логика апсерта для Excel- и JSON-импорта Товарной аналитики.
+    summaries: {(manager_id, period): {period_year, period_month, positions, qty, revenue}}
+    categories/items: {(manager_id, period): [{...}]}
+
+    Категории/товары апсертятся ПО ИМЕНИ, чтобы их id оставался стабильным между
+    загрузками — иначе точечные правки (product_overrides) будут "отвязываться" от
+    строки при каждом повторном импорте (CRM-данные могут обновляться задним числом
+    даже за прошлые месяцы). Строки, у которых есть активная правка, но которых
+    больше нет в свежей выгрузке, не удаляются — чтобы не терять правку.
+    """
     for (mid, period), vals in summaries.items():
         existing = await db.execute(
             select(ProductSalesSummary).where(
@@ -167,7 +192,7 @@ async def import_products(
         )
         summary_obj = existing.scalar_one_or_none()
         if summary_obj:
-            summary_obj.import_id = imp.id
+            summary_obj.import_id = import_id
             summary_obj.positions = vals["positions"]
             summary_obj.qty = vals["qty"]
             summary_obj.revenue = vals["revenue"]
@@ -175,7 +200,7 @@ async def import_products(
             summary_obj.period_month = vals["period_month"]
         else:
             summary_obj = ProductSalesSummary(
-                import_id=imp.id,
+                import_id=import_id,
                 manager_id=mid,
                 period=period,
                 period_year=vals["period_year"],
@@ -253,6 +278,98 @@ async def import_products(
             if not has_override.scalars().first():
                 await db.delete(row_obj)
 
+
+class ProductCategoryIn(BaseModel):
+    category: str
+    qty: float = 0
+    revenue: float = 0
+
+
+class ProductItemIn(BaseModel):
+    product_name: str
+    qty: float = 0
+    revenue: float = 0
+
+
+class ProductManagerPeriodIn(BaseModel):
+    manager: str                          # имя менеджера, как в CRM (сопоставляется по имени, как в Excel-импорте)
+    month: str                            # 'Август' и т.п. (рус. название месяца)
+    positions: Optional[float] = None     # если не задано — считается как len(items)
+    qty: float = 0
+    revenue: float = 0
+    categories: list[ProductCategoryIn] = []
+    items: list[ProductItemIn] = []
+
+
+class ProductImportJsonIn(BaseModel):
+    year: int
+    rows: list[ProductManagerPeriodIn]
+    source: str = "crm-json"              # для истории импортов (filename в ProductImport)
+
+
+@router.post("/import/products-json")
+async def import_products_json(body: ProductImportJsonIn, db: AsyncSession = Depends(get_db)):
+    """
+    JSON-эквивалент /import/products для автоматической ежедневной выгрузки
+    (без необходимости строить .xlsx файл и грузить его как multipart —
+    это нужно для сценария, где данные собираются скриптом/браузер-автоматизацией
+    напрямую из DOM CRM-отчёта «Аналитика -> Товары» и сразу отправляются на сайт).
+
+    Схема эквивалентна трём листам Excel-импорта, но сгруппирована по строкам
+    (manager, month) вместо трёх плоских списков — так проще собирать на стороне
+    источника (один менеджер = одна строка со своими категориями/товарами внутри).
+    """
+    mgr_result = await db.execute(select(Manager))
+    managers = mgr_result.scalars().all()
+    name_to_id = {_norm_name(m.name): m.id for m in managers}
+
+    unmatched_names = set()
+
+    def resolve_manager(raw_name: str):
+        mid = name_to_id.get(_norm_name(raw_name))
+        if mid is None:
+            unmatched_names.add(raw_name)
+        return mid
+
+    summaries = {}
+    categories = defaultdict(list)
+    items = defaultdict(list)
+
+    for row in body.rows:
+        mid = resolve_manager(row.manager)
+        month_num = MONTH_MAP.get(_norm_name(row.month))
+        if mid is None or not month_num:
+            continue
+        period = f"{row.month.strip().capitalize()} {body.year}"
+        positions = row.positions if row.positions is not None else len(row.items)
+        summaries[(mid, period)] = {
+            "period_year": body.year,
+            "period_month": month_num,
+            "positions": positions,
+            "qty": row.qty,
+            "revenue": row.revenue,
+        }
+        categories[(mid, period)] = [c.model_dump() for c in row.categories]
+        items[(mid, period)] = [i.model_dump() for i in row.items]
+
+    if not summaries:
+        raise HTTPException(
+            status_code=400,
+            detail="Не удалось сопоставить ни одной строки. Проверьте имена менеджеров: "
+                   + ", ".join(sorted(unmatched_names)) if unmatched_names else
+                   "Тело запроса пустое или названия месяцев не распознаны.",
+        )
+
+    imp = ProductImport(
+        filename=body.source,
+        manager_count=len({mid for (mid, _period) in summaries.keys()}),
+        row_count=len(summaries) + sum(len(v) for v in categories.values()) + sum(len(v) for v in items.values()),
+        status="done",
+    )
+    db.add(imp)
+    await db.flush()
+
+    await _upsert_products_data(db, imp.id, summaries, categories, items)
     await db.commit()
 
     matched_names = sorted({m.name for m in managers if m.id in {mid for (mid, _p) in summaries.keys()}})
