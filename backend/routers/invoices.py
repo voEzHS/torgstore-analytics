@@ -122,7 +122,19 @@ async def get_invoice_stats(manager_id: str, period: Optional[str] = None, db: A
 
 @router.get("")
 async def list_all_invoice_stats(period: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    query = select(InvoiceStats, Manager).join(Manager, Manager.id == InvoiceStats.manager_id)
+    # Фильтр Manager.is_active — этот эндпоинт используется как источник компанейских
+    # тоталов (Обзор.invoiceNetForScope, Прогноз), в отличие от team_center.py
+    # (Командный центр/Сравнение), который явно фильтрует активных менеджеров.
+    # Без этого фильтра уволенный менеджер с оставшимися в БД накладными (см.
+    # аудит 11.08.2026: Воробьева, июль 2026, 9 966 136₸) молча завышал общий
+    # тотал компании на сумму, не видную ни у одного менеджера в интерфейсе.
+    # Запись НЕ удаляется из БД (см. GET /invoices/{manager_id} без этого
+    # фильтра) — решение пользователя: оставить данные, но исключить из тоталов.
+    query = (
+        select(InvoiceStats, Manager)
+        .join(Manager, Manager.id == InvoiceStats.manager_id)
+        .where(Manager.is_active == True)
+    )
     if period:
         query = query.where(InvoiceStats.period == period)
     result = await db.execute(query)

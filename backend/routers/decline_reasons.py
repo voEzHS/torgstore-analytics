@@ -121,7 +121,14 @@ async def get_decline_reasons(manager_id: str, period: Optional[str] = None, db:
 
 @router.get("")
 async def list_all_decline_reasons(period: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    query = select(DeclineReasonStats, Manager).join(Manager, Manager.id == DeclineReasonStats.manager_id)
+    # Фильтр Manager.is_active — см. аналогичный фикс в invoices.py
+    # (аудит 11.08.2026: Воробьева, июль 2026, 6 лидов без причины, попадали
+    # в компанейскую сводку, хотя менеджер деактивирован и нигде не виден).
+    query = (
+        select(DeclineReasonStats, Manager)
+        .join(Manager, Manager.id == DeclineReasonStats.manager_id)
+        .where(Manager.is_active == True)
+    )
     if period:
         query = query.where(DeclineReasonStats.period == period)
     result = await db.execute(query)

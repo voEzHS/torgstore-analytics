@@ -247,9 +247,6 @@ async function fetchCompact(crmManagerId, startDate, endDate){
 
 ## 2. Накладные (касса/отгрузка) — второй, независимый источник
 
-Источник в CRM: «Аналитика → Топ продаж» → виджет «Менеджеры» (фильтр
-город + канал). Один снимок на менеджера/период/канал/город.
-
 ```
 POST http://localhost:8000/api/v1/invoices/import
 Content-Type: application/json
@@ -267,6 +264,338 @@ Content-Type: application/json
 ```
 `net_revenue` считается на бэкенде (`gross_revenue - returns_amount`),
 передавать не нужно. Апсерт идёт по `(manager_id, period, channel, city)`.
+
+### 2.1 Источник в CRM — найдено и проверено 10.08.2026 (быстрый JSON, БЕЗ DOM-скрейпинга)
+
+Раньше единственный известный источник был виджет «Аналитика → Топ продаж →
+Менеджеры» — HTML-фрагмент, требующий DOM-парсинга (медленно). 10.08.2026
+найден быстрый способ через тот же `total-sum-ajax`, что уже используется для
+Скидок (§3.5), плюс НОВЫЙ эндпоинт `list-ajax` с той же формой параметров —
+оба возвращают чистый JSON, оба дёргаются простым `fetch()`, DOM трогать не
+нужно вообще.
+
+**Страница CRM, где были найдены оба эндпоинта:** Склад → Накладные
+(`/service/warehouse/products/requests`). Форма фильтров на этой странице —
+`.requestsFilterForm`, submit-обработчик (`$('body').on('submit',
+'.requestsFilterForm', ...)`) при реальном сабмите одним махом стреляет СРАЗУ
+несколькими запросами без пауз между ними (`list-ajax` ×3 + `total-sum-ajax`
+×1 за ~1-2 секунды) — **это найдено эмпирически 10.08.2026 и является
+нарушением правила 3с, если сабмитить форму по-настоящему**
+(`$(...).trigger('submit')` или реальный клик). ⚠️ **НИКОГДА не сабмитить эту
+форму через UI/trigger('submit') — только вызывать оба эндпоинта напрямую
+через `fetch()` с ручной паузой 3с перед каждым отдельным вызовом**, как ниже.
+
+#### Эндпоинт 1 — `total-sum-ajax` (сумма, уже использовался для Скидок)
+
+`GET /service/warehouse/products/requests/total-sum-ajax` — см. §3.5 за полным
+описанием параметров. Возвращает `{success, message, totalSum,
+totalSumWithoutDiscount}`. Для накладных `gross_revenue` = `totalSum` (не
+`totalSumWithoutDiscount` — та поправка нужна только для скидок).
+
+#### Эндпоинт 2 — `list-ajax` (количество документов, НОВОЕ, найдено 10.08.2026)
+
+`POST /service/warehouse/products/requests/list-ajax` — та же форма
+параметров, что и `total-sum-ajax` (сериализация `.requestsFilterForm`), но
+методом POST и с `Content-Type: application/x-www-form-urlencoded`. Возвращает
+чистый JSON: `{success, message, data, totalCount, totalSum}`.
+
+**`totalCount` — это и есть `doc_count`.** `totalSum` в этом эндпоинте ВСЕГДА
+`0` (не считается) — за суммой всё равно нужно ходить в `total-sum-ajax`
+отдельно.
+
+Подтверждено 10.08.2026 живым тестом: `manager_id` реально фильтрует
+(Клара Кабиланова `manager_id=548` → `totalCount=84`; Ерганат Аубакир
+`manager_id=566` → `totalCount=59`, при одинаковых остальных параметрах —
+разные числа, значит фильтр по менеджеру реально работает).
+
+### 2.1.1 Расхождение с БД — РАЗОБРАНО и объяснено (10.08.2026)
+
+Изначально свежий тест для Ерганата за июль 2026 дал 59 документов /
+29,920,319 ₸ против уже лежащих в БД 63 / 32,017,144 ₸ (~6-7% меньше). После
+разбора — обе причины найдены и подтверждены:
+
+1. **`date_delivered_checked` — обязательный чекбокс, без него `date_delivered`
+   молча игнорируется.** Поля `date_assembled_checked`, `date_completed_checked`,
+   `date_delivered_checked`, `date_returned_checked`, `date_canceled_checked`,
+   `date_debt_checked` — это чекбоксы (`type=checkbox`, `value="on"`), а НЕ
+   декоративные подписи. Без `<поле>_checked=on` в запросе бэкенд использует
+   только верхний `date`/`date_other` (дата СОЗДАНИЯ документа), а не дату
+   доставки — это ДРУГОЙ фильтр. Подтверждено живым A/B-тестом 10.08.2026:
+   created-date фильтр (`date=other&date_other=...`) дал 29,920,319 ₸;
+   delivery-date фильтр (`date=any&date_delivered_checked=on&date_delivered=...`)
+   дал 33,772,734 ₸ для одних и тех же manager/период/status — числа РАЗНЫЕ,
+   значит переключатель реально работает и разница именно в выборе поля даты.
+   **Для «продано в периоде X» нужен `date_delivered_checked=on`, не
+   `date=other`.**
+2. **Старое значение в БД (63/32.0M) — это НЕполный месяц.** У существующей
+   строки `snapshot_at = 2026-07-25` — импорт был сделан 25 июля, т.е. ДО
+   конца месяца (не хватает 26-31 июля). Разница в ~8 документов при темпе
+   Ерганата ~2/день за недостающие 6 дней — совершенно ожидаемая величина.
+   **Это не баг, это устаревший частичный снэпшот** — свежая выгрузка за
+   полный месяц ЗАКОНОМЕРНО больше.
+
+### 2.1.2 Отдельная, подтверждённая проблема — `sale_channel` НЕ фильтрует (баг CRM, не мой)
+
+Прямым A/B-тестом (одинаковые все параметры, меняется только `sale_channel`)
+подтверждено на ОБОИХ эндпоинтах: `sale_channel=0` («любой») и `sale_channel=2`
+(«Розничные продажи Алматы») дают **побайтово идентичный** результат —
+`total-sum-ajax` вернул `33,772,734 ₸` в обоих случаях, `list-ajax` вернул
+`totalCount=71` в обоих случаях (тест на Ерганате, delivery-date фильтр,
+status=8). Поле правильное (`select[name="sale_channel"]`, не мультивыбор,
+без `[]`), значит это реальное ограничение бэкенда CRM для этой пары
+эндпоинтов, а не ошибка в параметрах с моей стороны.
+
+**Следствие:** через `total-sum-ajax`/`list-ajax` можно получить только
+выручку/количество документов «по ВСЕМ каналам сразу» — по отдельному каналу
+(«Розничные продажи» отдельно от «Каспи»/«Дилеры» и т.д.) эти два эндпоинта
+корректно не фильтруют. Разбивка по каналу (задача «Разбивка накладных по
+каналу», пока не реализована на сайте) через этот быстрый путь недостижима;
+если она когда-нибудь понадобится — только через медленный DOM-путь (виджет
+«Топ продаж → Менеджеры», реальный UI-клик по фильтру канала).
+
+**Решение по умолчанию — ИСПРАВЛЕНО 10.08.2026 после аудита-перед-прогоном:**
+изначально планировалось писать под меткой `"Все каналы"`, но проверка кода
+сайта (`backend/analytics/team_center.py:_invoice_net`, фронтенд
+`invoiceNetForScope`/`invoiceBreakdownForScope`/`renderMgrInvoices`) показала:
+**везде накладные суммируются по ВСЕМ строкам `(manager_id, period)` без
+фильтра по каналу.** Апсерт же ключуется на `(manager_id, period, channel,
+city)` — то есть новая строка с ДРУГОЙ меткой канала не перезаписала бы
+старую, а легла бы РЯДОМ, и выручка/кол-во документов задвоились бы на всём
+сайте (Обзор, Менеджер, Сравнение, Прогноз, Командный центр) для любого
+периода, где уже есть строка `"Розничные продажи"`.
+**Поэтому канал в payload остаётся `"Розничные продажи"` (тот же, что и
+раньше)** — это тот же ключ апсерта, значит новые (более точные, по всем
+каналам физически) данные корректно ПЕРЕЗАПИШУТ старые, а не задублируются.
+Метка теперь технически не совсем точна (число по факту «все каналы», не
+только розница) — это сознательный компромисс ради целостности данных, до
+тех пор пока задача «Разбивка накладных по каналу» (#95) не даст сайту
+реальную поддержку нескольких строк на канал.
+
+Для **возвратов** (`returns_amount`/`returns_count`) — те же два эндпоинта,
+только `status_id[]=7` («Возврат осуществлен») вместо `8`.
+
+### 2.2 Готовый скрипт v3 (консоль вкладки CRM) — crmGet копировать целиком в начало КАЖДОГО отдельного вызова javascript_tool, см. §0
+
+```js
+// v3 — см. §0. Пауза 3с зашита безусловно перед КАЖДЫМ запросом.
+async function crmGet(url, opts){
+  await new Promise(r => setTimeout(r, 3000));
+  const r = await fetch(url, Object.assign({headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}}, opts||{}));
+  return await r.json();
+}
+
+// ⚠️ date_delivered_checked=on ОБЯЗАТЕЛЕН — без него date_delivered молча
+// игнорируется и фильтруется по дате СОЗДАНИЯ документа, не по дате
+// доставки (см. §2.1.1, разобрано и подтверждено 10.08.2026).
+// ⚠️ sale_channel НЕ РАБОТАЕТ на этой паре эндпоинтов (подтверждено §2.1.2,
+// A/B-тест дал побайтово одинаковый результат при channel=0 и channel=2) —
+// всегда шлём 0 («все каналы»), параметр оставлен в сигнатуре только чтобы
+// не забыть при след. проверке, будет ли это когда-нибудь починено в CRM.
+function buildQS(dateFrom, dateTo, managerId, saleChannel, statusId){
+  const dr = encodeURIComponent(`${dateFrom} - ${dateTo}`); // ДД/ММ/ГГГГ
+  return `search=&sortby=default&smart=&sku=&client_name=&type=any&date=any`
+    + `&date_other=&date_assembled_checked=&date_assembled=`
+    + `&date_completed_checked=&date_completed=`
+    + `&date_delivered_checked=on&date_delivered=${dr}`
+    + `&date_returned_checked=&date_returned=&date_canceled_checked=&date_canceled=`
+    + `&date_debt_checked=&date_debt=`
+    + `&invoice_sum_from=&invoice_sum_to=&client_id=&manager_id=${managerId}`
+    + `&assembler_id=all&packager_id=all&courier_id=all&payments_method=0&discount_id=any`
+    + `&sale_channel=${saleChannel}&utm_source=0&utm_medium=&utm_campaign=&utm_term=&utm_content=`
+    + `&bill_id=0&service_point=0&shipment_point=0&return_warehouse=0&with_docs=all&promotion=all`
+    + `&via_source=0&page=1&path=%2Fservice%2Fwarehouse%2Fproducts%2Frequests&status_id%5B%5D=${statusId}`;
+}
+
+let timestampsLog = []; // сбрасывать перед каждым новым менеджером
+
+// gross_revenue + doc_count (status 8 = Доставлено) ИЛИ
+// returns_amount + returns_count (status 7 = Возврат осуществлен)
+// saleChannel всегда 0 (см. предупреждение выше — фильтр всё равно не работает)
+async function invoiceStatsRaw(crmManagerId, dateFrom, dateTo, saleChannel, statusId){
+  const qs = buildQS(dateFrom, dateTo, crmManagerId, saleChannel, statusId);
+
+  const sumJ = await crmGet(`/service/warehouse/products/requests/total-sum-ajax?${qs}`);
+  timestampsLog.push(Date.now());
+  const num = s => Number(String(s).replace(/[^\d.-]/g,'')) || 0;
+
+  const cntJ = await crmGet(`/service/warehouse/products/requests/list-ajax`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+    body: qs,
+  });
+  timestampsLog.push(Date.now());
+
+  return { amount: num(sumJ.totalSum), count: cntJ.totalCount };
+}
+
+// Пример: Ерганат Аубакир (CRM id 566), Июль 2026. saleChannel всегда 0.
+async function invoiceStatsForManager(crmManagerId, dateFrom, dateTo){
+  timestampsLog = [];
+  const delivered = await invoiceStatsRaw(crmManagerId, dateFrom, dateTo, 0, 8);
+  const returned  = await invoiceStatsRaw(crmManagerId, dateFrom, dateTo, 0, 7);
+
+  const gaps = timestampsLog.slice(1).map((t,i) => (t - timestampsLog[i]) / 1000);
+  if (!gaps.every(g => g >= 2.9)) {
+    throw new Error('RATE LIMIT VIOLATION for manager ' + crmManagerId + ': ' + JSON.stringify(gaps));
+  }
+  return {
+    gross_revenue: delivered.amount,
+    doc_count: delivered.count,
+    returns_amount: returned.amount,
+    returns_count: returned.count,
+    _debug: { gaps }
+  };
+}
+// await invoiceStatsForManager(566, '01/07/2026', '31/07/2026')
+```
+
+4 запроса на менеджера/период (2 статуса × 2 эндпоинта) — с правилом 3с это
+~12с на менеджера, для 17 менеджеров ~3.5 минуты. Значительно быстрее
+DOM-скрейпинга (Товарная аналитика, §2.5.1, занимает 20-190с на менеджера).
+
+Результат передавать в `POST /api/v1/invoices/import` как в начале раздела 2,
+**с `"channel": "Все каналы"`** (не «Розничные продажи» — см. §2.1.2, эти
+эндпоинты не умеют фильтровать по каналу, число всегда по всем каналам сразу).
+
+### 2.3 Полный прогон по всем менеджерам (fire-and-forget) — обязателен для 17+ менеджеров
+
+⚠️ **Аудит 10.08.2026 (по запросу пользователя, ДО первого реального массового
+прогона):** живой A/B-тест на 2 менеджерах подряд подтвердил, что пауза
+держится честно — 8 запросов, все 7 разрывов между ними ~4.0с (минимум
+3.998с), **включая стык между менеджерами** (там раньше проваливались v1/v2,
+см. §0). Но арифметика на масштаб не сходится с одним `javascript_tool`
+вызовом: 17 менеджеров × 4 запроса × ~4с ≈ 270с (~4.5 минуты) — это **намного
+больше** 45-секундного потолка `Runtime.evaluate` (см. §2.5.1, та же ловушка
+уже ловилась на Товарной аналитике). Функция `invoiceStatsForManager` из §2.2
+сама по себе корректна и безопасна, но **`await`-ить её в цикле по всем 17
+менеджерам одним вызовом `javascript_tool` НЕЛЬЗЯ** — упадёт по таймауту
+инструмента (сам JS в странице при этом продолжит работать независимо, как и
+в случае с товарной аналитикой, но результат перестанет быть виден). Нужен
+тот же fire-and-forget + poll паттерн, что и в §2.5.1.
+
+**Шаг 1 — на табе B (сайт), получить список менеджеров:**
+```js
+const r = await fetch('/api/v1/managers');
+const j = await r.json();
+window.__siteMgrsInv = j.filter(m => m.id !== '00000000-0000-0000-0000-000000000001')
+                        .map(m => ({id: m.id, name: m.name}));
+window.__siteMgrsInv.length;
+```
+
+**Шаг 2 — на табе A (CRM, `/service/warehouse/products/requests`), запустить
+fire-and-forget цикл.** `crmGet`/`buildQS`/`invoiceStatsRaw`/`invoiceStatsForManager`
+— как в §2.2 (id менеджеров в СВОЁМ числовом пространстве этой страницы,
+сопоставлять по имени свежо на каждый прогон, как в §2.5.1 — id НЕ совпадают
+с другими отчётами):
+```js
+// ...вставить сюда crmGet/buildQS/invoiceStatsRaw/invoiceStatsForManager из §2.2 целиком...
+
+function norm(s){ return s.replace(/\s+/g,' ').trim().toLowerCase(); }
+const sel = document.querySelector('select[name="manager_id"]');
+const opts = Array.from(sel.options).map(o => ({value:o.value, text:o.textContent.trim()}));
+const byNorm = {}; opts.forEach(o => byNorm[norm(o.text)] = o);
+
+// подставить сюда реальный список из window.__siteMgrsInv (Шаг 1): [{id, name}, ...]
+const siteMgrs = [/* ... */];
+
+const matched = [], unmatchedNames = [];
+for (const m of siteMgrs) {
+  const hit = byNorm[norm(m.name)];
+  if (hit) matched.push({siteId: m.id, name: m.name, crmId: hit.value}); else unmatchedNames.push(m.name);
+}
+
+window.__invProgress = 0;
+window.__invTotal = matched.length;
+window.__invUnmatched = unmatchedNames;
+window.__invDone = false;
+window.__invError = null;
+window.__invGaps = null;
+window.__invPayload = null;
+window.__invAuditLog = []; // таймстамп ПЕРЕД каждым реальным fetch — глобальный, на весь прогон
+
+(async () => {
+  try {
+    const rowsOut = [];
+    for (const m of matched) {
+      const stats = await invoiceStatsForManager(m.crmId, DATE_FROM, DATE_TO); // напр. '01/08/2026', '10/08/2026'
+      rowsOut.push({
+        manager_id: m.siteId,
+        period: PERIOD_LABEL,        // напр. 'Август 2026' — см. §2.5 про частичный месяц, если период неполный
+        channel: 'Розничные продажи', // см. §2.1.2 — ТОТ ЖЕ ключ апсерта, что и раньше (не "Все каналы"!),
+                                       // иначе задвоится с уже существующими строками на всём сайте
+        city: 'Алматы',
+        gross_revenue: stats.gross_revenue,
+        doc_count: stats.doc_count,
+        returns_amount: stats.returns_amount,
+        returns_count: stats.returns_count,
+      });
+      window.__invProgress++;
+    }
+
+    // САМОПРОВЕРКА §0 на ВЕСЬ прогон целиком (не только внутри одного менеджера)
+    const gaps = window.__invAuditLog.slice(1).map((t,i) => (t - window.__invAuditLog[i]) / 1000);
+    if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
+
+    window.__invGaps = gaps;
+    window.__invPayload = rowsOut;
+    window.__invDone = true;
+  } catch (e) {
+    window.__invError = String(e);
+    window.__invDone = true;
+  }
+})();
+
+JSON.stringify({ started: true, totalManagers: matched.length, unmatchedNames });
+```
+⚠️ Чтобы самопроверка видела ВЕСЬ прогон (а не только пары внутри одного
+менеджера, как в базовом `invoiceStatsForManager` из §2.2), `crmGet` в этом
+цикле должен писать timestamp в `window.__invAuditLog` (глобальный, без
+сброса между менеджерами) вместо/в дополнение к локальному `timestampsLog`
+— именно так был устроен живой аудит-тест 10.08.2026 (см. выше), просто
+скопировать оттуда `crmGet`.
+
+**Шаг 2b — опрос прогресса** (отдельные короткие вызовы, каждые ~15-20с;
+полный прогон 17 менеджеров ≈ 68 запросов × ~4с ≈ 4.5-5 минут — это
+нормально, скорость не приоритет):
+```js
+JSON.stringify({
+  progress: window.__invProgress, total: window.__invTotal,
+  done: window.__invDone, error: window.__invError,
+  gaps: window.__invGaps, payloadRows: window.__invPayload ? window.__invPayload.length : null,
+});
+```
+Если `error` не `null` — прогон упал (в т.ч. если самопроверка поймала
+нарушение §0) — **остановиться, не импортировать частичные данные молча**,
+разобраться в причине (см. §0 «если правило неясно применимо — трактовать в
+пользу осторожности»), при необходимости `navigate()` для чистого состояния
+и перезапустить Шаг 2 с нуля.
+
+**Шаг 3 — забрать payload без обрезки** (после `done:true` и `error:null`,
+тот же приём, что в §1.6/§3.5/§2.5.1):
+```js
+document.body.innerHTML = '<pre id="__dump"></pre>';
+document.getElementById('__dump').textContent = JSON.stringify(window.__invPayload);
+'dumped, length=' + document.getElementById('__dump').textContent.length;
+```
+затем `get_page_text` на этом же табе.
+
+**Шаг 4 — на табе B (сайт), отправить построчно** (эндпоинт `/invoices/import`
+принимает один срез manager/period/channel/city за раз, не батч — цикл на
+табе B к СВОЕМУ backend не подпадает под правило §0, паузы не нужны):
+```js
+const payload = /* JSON.parse(...) текста из Шага 3 */;
+const results = [];
+for (const row of payload) {
+  const r = await fetch('/api/v1/invoices/import', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(row),
+  });
+  results.push({manager_id: row.manager_id, status: r.status, ok: r.ok});
+}
+JSON.stringify(results);
+```
+
 
 ---
 
@@ -719,6 +1048,348 @@ JSON.stringify({status: r.status, ...j});
 
 ---
 
+## 6. Причины отказа — найдено и проверено 10.08.2026 (быстрый JSON, БЕЗ DOM-скрейпинга)
+
+```
+POST http://localhost:8000/api/v1/decline-reasons/import
+Content-Type: application/json
+
+{
+  "manager_id": "<UUID менеджера на сайте>",
+  "period": "Август 2026",
+  "pipeline": "Отдел первичных продаж",
+  "sample_size": 12,
+  "reasons": [
+    {"reason": "Дорого", "count": 5},
+    {"reason": "Нет в наличии", "count": 3},
+    {"reason": "Передумал", "count": 4}
+  ]
+}
+```
+⚠️ **Это ЗАМЕНА, не накопление**: бэкенд удаляет старый срез по ключу
+`(manager_id, period, pipeline)` и вставляет новый (см.
+`backend/routers/decline_reasons.py:60-69`). Значит на вход всегда нужен
+**весь диапазон периода целиком** (1 число месяца → сегодня), а не только
+«новые» лиды со вчерашнего дня — ровно как для остальных источников в §5.
+Разные `pipeline` для одного `manager_id`+`period` НЕ конфликтуют и не
+перезаписывают друг друга (уникальность в БД — по четвёрке `manager_id,
+period, pipeline, reason`), фронтенд суммирует их корректно с раскрытием
+`pipelinesLabel` (проверено 10.08.2026 отдельным аудитом кода, добавлено в
+сессии 07.08.2026) — так что бояться задвоения при смене названия воронки
+не нужно.
+
+### 6.1 Источник в CRM
+
+Раньше (сессии до 10.08.2026) причины отказа читались вручную, по одному
+лиду за раз через UI (см. комментарий в начале `decline_reasons.py` и задачи
+#286-289/#308/#313 в трекере) — без задокументированной, воспроизводимой
+процедуры. 10.08.2026 реверс-инжинирингом найдены 3 быстрых JSON-эндпоинта
+CRM, которые вместе полностью автоматизируют выгрузку без единого клика по
+UI и без парсинга HTML:
+
+**Воронка:** `pineline_id=91` = «Отдел первичных продаж» (не «Розница
+Алматы», `pineline_id=1` — это другая, более старая воронка; список всех
+воронок компании — `GET /api/crm/leads/pineline/get_pinelines`). Это
+активная воронка, в которую сейчас реально падают новые лиды (проверено
+живым просмотром 10.08.2026) — совпадает с тем, что нашла предыдущая сессия
+для 1-6 августа (задача #312/#313).
+
+**Эндпоинт 1 — список «отказных» лидов периода:**
+```
+GET /api/crm/leads/pineline/stage/leads_by_all_stages
+    ?pineline_id=91&type_ids[]=3&page=N&limit=100
+```
+`type_ids[]=3` = фильтр по типу этапа «Не реализовано» (не по конкретному
+`stage_id` — на случай если в воронке несколько «отказных» этапов; в текущей
+воронке 91 такой этап один, `stage_id=510`). Ответ — `{stages:[{stage,
+total_sum, leads:[...], meta:{page, total_pages, total_records}}]}`. Каждый
+`lead` уже содержит `id`, `manager.id`, `manager.full_name`, `create.created_at`
+— **без доп. запроса за менеджером**. Пагинация — `page`/`limit` (макс.
+проверенный `limit=100`). У эндпоинта **нет** параметра диапазона дат —
+дата-фильтрация делается на своей стороне (`created_at` уже есть в ответе).
+
+**Эндпоинт 2 — детали одного лида (поле «Причина отказа»):**
+```
+GET /api/crm/leads/details?lead_id=<id>
+```
+Ответ: `{data:{..., custom_fields:[{id:9, name:"Причина отказа", value:"Нет в
+наличии", ...}, ...]}}`. Поле `id=9` — фиксированный ID кастомного поля
+«Причина отказа» в этой воронке (получен через `GET
+/api/crm/leads/fields/stages?pineline_id=91`, там же — полный список из 8
+возможных значений: Дорого / Нет в наличии / Купил у других / Передумал /
+Недозвон-Нет ответа / Запрос БТ / Запрос Запчасти / Другой город-Цена
+логистики). Если лид ещё не переведён в «Не реализовано» — `value: null`
+(на практике не должно случаться, т.к. поле `required_from_stage` = «Не
+реализовано» на стороне CRM).
+
+**Почему нужен запрос №2 на КАЖДЫЙ лид:** причина отказа — это
+per-лид кастомное поле, эндпоинт №1 (список) его не отдаёт вообще (проверено
+живым сравнением полей ответа). В отличие от Накладных (§2), тут нет
+эквивалента `list-ajax`/`total-sum-ajax` с готовым агрегатом по причине —
+дергать реальный лид приходится по одному.
+
+### 6.2 Объём запросов — оценено и подтверждено живым прогоном 10.08.2026
+
+Шаг 1 (список, `type_ids[]=3`, весь пайплайн 91, без ограничения по дате) —
+**341 лид за всё время** существования воронки, 4 страницы по `limit=100`
+→ **4 запроса**, ~16 секунд.
+
+Из них с `created_at` в диапазоне 01.08.2026–10.08.2026 (частичный месяц,
+10 дней) — **166 лидов** → **166 запросов** к `leads/details`, ~4с/запрос
+(3с пауза + сеть) → **≈ 11 минут**. Это больше, чем Накладные (68 запросов,
+§2.3), но того же порядка, что Товарная аналитика по общему времени (§2.5.1)
+— и **не является проблемой** по правилу §0 («скорость не важна, важно не
+попасть под блокировку»). Ожидаемо, что дальше в месяце объём будет расти
+пропорционально дням (166 за 10 дней ⇒ ориентировочно 500-550 за полный
+месяц) — как и везде, это нормально, не признак ошибки.
+
+**Обязателен fire-and-forget + poll** (45-секундный потолок
+`Runtime.evaluate`, та же ловушка, что в §2.5.1/§2.3) — НЕ `await`-ить цикл
+из 166+ запросов одним вызовом `javascript_tool`.
+
+### 6.3 Готовый скрипт v3 (консоль вкладки CRM)
+
+**Шаг 1 — собрать список «отказных» лидов периода** (обычный `await`-вызов,
+4 страницы укладываются в лимит одного вызова инструмента):
+```js
+async function crmGet(url, opts){
+  await new Promise(r => setTimeout(r, 3000));
+  const r = await fetch(url, Object.assign({headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}}, opts||{}));
+  return await r.json();
+}
+const log = [];
+let page = 1, totalPages = 1;
+const allLeads = [];
+do {
+  log.push(Date.now());
+  const j = await crmGet(`/api/crm/leads/pineline/stage/leads_by_all_stages?pineline_id=91&type_ids%5B%5D=3&page=${page}&limit=100`);
+  const grp = j.stages && j.stages[0];
+  if (!grp) break;
+  totalPages = grp.meta.total_pages;
+  for (const l of grp.leads) {
+    allLeads.push({id: l.id, manager_id: l.manager && l.manager.id, manager_name: l.manager && l.manager.full_name, created_at: l.create && l.create.created_at});
+  }
+  page++;
+} while (page <= totalPages);
+
+const gaps = log.slice(1).map((t,i)=>(t-log[i])/1000);
+if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
+
+// подставить реальный диапазон периода (YYYY-MM-DD, левая граница включительно,
+// правая — первый день СЛЕДУЮЩЕГО дня после конца диапазона, т.к. created_at
+// хранит время):
+const DATE_FROM = '2026-08-01', DATE_TO_EXCLUSIVE = '2026-08-11';
+window.__periodLostLeads = allLeads.filter(l => l.created_at && l.created_at >= DATE_FROM && l.created_at < DATE_TO_EXCLUSIVE);
+JSON.stringify({totalPages, totalFetched: allLeads.length, gaps, periodCount: window.__periodLostLeads.length});
+```
+
+**Шаг 2 — fire-and-forget по каждому лиду периода** (глобальный
+`__reasonAuditLog`, самопроверка на ВЕСЬ прогон целиком — тот же паттерн,
+что в §2.3):
+```js
+window.__reasonProgress = 0;
+window.__reasonTotal = window.__periodLostLeads.length;
+window.__reasonDone = false;
+window.__reasonError = null;
+window.__reasonGaps = null;
+window.__reasonAgg = null;
+window.__reasonAuditLog = [];
+
+(async () => {
+  try {
+    async function crmGet(url){
+      await new Promise(r => setTimeout(r, 3000));
+      window.__reasonAuditLog.push(Date.now());
+      const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
+      return await r.json();
+    }
+    const agg = {}; // manager_id -> {manager_name, reasons: {reason: count}, sample_size}
+    for (const lead of window.__periodLostLeads) {
+      const j = await crmGet(`/api/crm/leads/details?lead_id=${lead.id}`);
+      const cf = (j.data && j.data.custom_fields || []).find(f => f.id === 9);
+      const reason = (cf && cf.value) ? cf.value : 'Не указана';
+      const mgrId = lead.manager_id || 'unknown';
+      const mgrName = lead.manager_name || 'Неизвестно';
+      if (!agg[mgrId]) agg[mgrId] = {manager_name: mgrName, reasons: {}, sample_size: 0};
+      agg[mgrId].reasons[reason] = (agg[mgrId].reasons[reason] || 0) + 1;
+      agg[mgrId].sample_size++;
+      window.__reasonProgress++;
+    }
+    const gaps = window.__reasonAuditLog.slice(1).map((t,i) => (t - window.__reasonAuditLog[i]) / 1000);
+    if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
+    window.__reasonGaps = gaps;
+    window.__reasonAgg = agg;
+    window.__reasonDone = true;
+  } catch (e) {
+    window.__reasonError = String(e);
+    window.__reasonDone = true;
+  }
+})();
+JSON.stringify({started: true, total: window.__reasonTotal});
+```
+
+**Шаг 2b — опрос** (каждые ~60-90с, полный прогон на 150-550+ лидов ≈
+10-40 минут):
+```js
+JSON.stringify({progress: window.__reasonProgress, total: window.__reasonTotal, done: window.__reasonDone, error: window.__reasonError, gaps: window.__reasonGaps});
+```
+Если `error` не `null` — остановиться, не импортировать частичные данные,
+см. §0.
+
+**Шаг 3 — забрать агрегат без обрезки:**
+```js
+document.body.innerHTML = '<pre id="__dump"></pre>';
+document.getElementById('__dump').textContent = JSON.stringify(window.__reasonAgg);
+'dumped, length=' + document.getElementById('__dump').textContent.length;
+```
+затем `get_page_text` на этом же табе. Дальше по нужному менеджеру
+преобразовать `{manager_name, reasons:{...}, sample_size}` в payload из
+начала §6 (`reasons` — массив `{reason, count}` из `Object.entries`) и
+отправить построчно на Табе B — `manager_id` (UUID сайта) сопоставлять по
+имени со списком `GET /api/v1/managers` (как в §2.3), НЕ по CRM `manager_id`
+из ответа (числовое CRM-пространство, не совпадает с UUID сайта).
+
+---
+
+## 7. Планы продаж — оценка автоматизируемости (11.08.2026)
+
+### 7.1 Где это в CRM
+
+Раздел находится не в самом модуле «Лиды», а в общем сайдбаре сервисов:
+`☰ → CRM → План продаж` → `https://torgstore.zymyran.com/service/crm/sales-plans`.
+Раньше (сессия 07.08.2026, задачи #341-344) план выгружался вручную построчно
+через UI без задокументированного механизма — 11.08.2026 найдены 2 реальных
+JSON-эндпоинта за этим экраном.
+
+### 7.2 Структура данных — ПО КАНАЛУ, не по менеджеру напрямую
+
+Ключевое отличие от остальных 5 источников: план продаж задаётся на уровне
+**канала** (по сути — воронки/подразделения × город, например «Каспи Алматы»,
+«Каспи Шымкент», «Дилеры Астана», «TikTok продажи» и т.д. — 22 канала на
+август 2026), а не на менеджера напрямую. Один менеджер может быть привязан
+к нескольким каналам (см. уже существующую заметку в §5 п.5 «агрегация по
+всем каналам менеджера») — значит план менеджера = сумма его прогресса по
+всем каналам, где он указан ответственным.
+
+### 7.2.1 🚨 ИСПРАВЛЕНИЕ (12.08.2026): план компании = 3 канала × Алматы, НЕ все 22 канала
+
+**Ошибка, допущенная в этой же сессии:** первая попытка посчитать план
+компании суммировала `sales_target` по ВСЕМ ~22-23 каналам pineline_id=91
+(включая Каспи, Дилеров, Айдын Опт, Корпоративные продажи, Мастер продаж,
+Customer service, Магазин Шымкент, Супер-дилеров Байсат и т.д.) — это дало
+завышенные цифры (например, Июнь = 1,000,000,000 вместо реальных 325,000,000).
+Пользователь дважды поправил:
+
+1. «Мы работаем только с каналами - Инстаграм Тикток и розница» — считать
+   только 3 ТИПА канала: `Розничные продажи`, `Инстаграм`, `TikTok продажи`
+   (регэксп для матчинга: `/Розничн|Инстаграм|TikTok/i` — НЕ `/розниц|.../i`,
+   т.к. «розниц» не подстрока «Розничные»: после «розн» буквы расходятся —
+   «и-ц» vs «и-ч»).
+2. «стоп сразу говорю только Алматы учитываем. Шымкент Астана пока нет» —
+   из этих 3 типов канала брать ТОЛЬКО городской вариант «Алматы» (`city`
+   в ответе `/api/crm/plans/monthly`), Шымкент/Астана-варианты исключить.
+
+**Правильный набор на 11-12.08.2026 (id стабильны, проверять при каждом
+прогоне через `/api/crm/plans/monthly`, т.к. могут пересоздаваться):**
+`point_id 2` = «Розничные продажи»/Алматы, `point_id 51` = «Инстаграм»/Алматы,
+`point_id 58` = «TikTok продажи»/Алматы. Итого **3 канала**, не 22-23 и не 8
+(8 — это те же 3 типа, но по всем 3 городам сразу — тоже неверно, была
+промежуточная ошибка перед финальной поправкой).
+
+Company-wide план = сумма `sales_target` этих 3 point-ов (напрямую из
+`points[]` ответа `/api/crm/plans/monthly`, без похода в
+`manager-channels`). Личный план менеджера = сумма его `sales_target` из
+`manager-channels` **только для этих 3 point_id**, не для всех каналов, где
+он назначен.
+
+**Важно:** сумма личных планов (только эти 3 канала, только Алматы) НЕ
+обязана совпадать с company-wide суммой (это разные точки данных в CRM —
+план на point и его разбивка по менеджерам иногда расходятся, сама CRM это
+не сверяет). Не пытаться их искусственно уравнивать — грузить оба числа как
+есть.
+
+Раздел §7.3-§7.4 ниже и чек-лист §5 п.5 описывают более ранний (более общий,
+но методологически неверный для company-wide плана) способ сбора «все N
+каналов» — сам механизм эндпоинтов верный, но при импорте плана компании
+и личных планов использовать фильтр из этого раздела (3 канала × Алматы),
+а не весь список `points`.
+
+### 7.3 Найденные эндпоинты и рабочий payload (взломано 11.08.2026, той же сессией)
+
+**Эндпоинт 1 — сводка по всем каналам сразу:**
+```
+POST /api/crm/plans/monthly
+```
+Отдаёт ВСЕ 22 канала одним запросом: по каждому — `id`, `name.ru`, `city`,
+`sales_target`, `current_sales`, плюс общий блок `global` (компания целиком:
+`current_sales`, `sales_target`, `sales_forecast`, `old_target`).
+
+**Эндпоинт 2 — разбивка канала по менеджерам:**
+```
+POST /api/crm/plans/manager-channels
+```
+По одному каналу — список менеджеров, отвечающих за него, с `id`, `name`,
+`url`, `sales_target`, `current_sales` (доля канала на этого менеджера).
+
+**Рабочий payload найден брутфорсом ("superset"-тело), а не перехватом.**
+`{}` и `{month, year}` возвращали общий `400 The given data was invalid`
+без детализации по полям; monkey-patch `window.fetch`/`XMLHttpRequest` тоже
+не поймал реальные запросы (SPA держит свою ссылку на `fetch`, полученную до
+патча — тот же паттерн, что и раньше на этом проекте, см. историю). Сработал
+один запрос со всеми правдоподобными именами полей сразу — тратить время на
+сужение до минимального набора не стал, суперсет надёжен и стабилен:
+
+```js
+const commonBody = {
+  pineline_id: 91, month: 8, year: 2026, period: "2026-08",
+  date: "2026-08-01", date_from: "2026-08-01", date_to: "2026-08-31"
+};
+// Эндпоинт 1:
+await crmPost('/api/crm/plans/monthly', commonBody);   // → {global, points:[...22 канала]}
+// Эндпоинт 2 (для каждого канала p из points):
+await crmPost('/api/crm/plans/manager-channels',
+  Object.assign({point_id: p.id, sales_point_id: p.id, channel_id: p.id, id: p.id}, commonBody));
+```
+`pineline_id: 91` — id воронки/подразделения, привязанной к плану продаж
+(остальные месяцы/годы меняются в `commonBody`, `pineline_id` пока не
+проверялся на других воронках — если план заведён на другой pineline,
+возможно потребуется его найти отдельно).
+
+### 7.4 Объём запросов, автоматизируемость и приведение к общему стандарту
+
+**Полностью автоматизируемо чистым fetch — как остальные 5 источников.**
+Никакой click-driven план не нужен, отменяет прежний вывод этого раздела.
+
+Итого **23 запроса** (1 × monthly + 22 × manager-channels) с паузой ≥3с между
+каждым (правило §0), фактически ~90 секунд на fire-and-forget-скрипт с
+проверкой `gaps.every(g=>g>=2.9)` внутри — тот же v3-паттерн, что и у
+остальных источников (см. §0). Проверенный прогон 11.08.2026: 23/23 без
+ошибок, минимальный интервал 3.999с.
+
+**Агрегация по менеджеру** — так как план задаётся на канал, а не на
+менеджера напрямую (см. §7.2): суммировать `sales_target`/`current_sales` по
+всем каналам, где менеджер встречается в ответе `manager-channels`. Прогон
+11.08.2026 вернул 63 CRM-профиля (среди них есть не-менеджеры/боты с
+доступом к каналам, посторонний персонал — фильтровать сопоставлением с
+`GET /api/v1/managers` сайта, как во всех остальных источниках).
+
+**Импорт на сайт** — тот же механизм, что уже существовал (см.
+`backend/routers/period_targets.py`): `PUT /api/v1/period-targets` с
+`period: "mgr:<UUID-сайта>:Август 2026"` и `plan: <сумма target по каналам>`
+для личных планов, плюс отдельный `PUT` с `period: "Август 2026"` (без
+префикса) и `plan: <global.sales_target>` для плана компании целиком.
+Никакой новой бэкенд-логики не требуется — эндпоинт уже поддерживал
+синтетический `mgr:`-префикс с 30.07.2026.
+
+**Известный, ожидаемый пробел (не баг):** не все менеджеры сайта обязательно
+назначены ответственными хоть за один канал в CRM в конкретном месяце — если
+менеджер отсутствует в агрегации, значит в CRM у него в этом месяце нет
+назначенного плана ни по одному каналу; план для него на сайте не
+проставляется (не 0 — просто нет записи), это нужно перепроверять при каждом
+прогоне, а не считать пропуском импорта.
+
+---
+
 ## 5. ✅ Чек-лист «актуализировать данные за период X» — ВСЕ источники сразу
 
 Когда пользователь просит «актуализировать», «обновить данные», «подтяни
@@ -735,10 +1406,24 @@ JSON.stringify({status: r.status, ...j});
    (DOM-скрипт, без файла) — тянет диапазон «1 число текущего месяца → сегодня»,
    апсерт идемпотентен, частичный месяц НЕ проблема (перезаливается заново
    каждый день по мере роста диапазона).
-5. **Планы продаж** — раздел «CRM → Планы продаж», см. сессию 07.08.2026
-   (агрегация по всем каналам менеджера, не только по одному).
-6. **Причины отказа** — Лиды → Фильтр → «Причина Отказа», см. раздел про
-   декабрь/причины отказа (`decline_reasons`).
+5. **Планы продаж** — §7 (см. ОБЯЗАТЕЛЬНО §7.2.1 — исправление методологии
+   12.08.2026). `POST /api/crm/plans/monthly` даёт все ~22-23 канала, но для
+   company-wide и личных планов брать **только 3**: `Розничные продажи`,
+   `Инстаграм`, `TikTok продажи`, и только город **Алматы** (на 11-12.08.2026
+   это `point_id` 2/51/58 — проверять по `city`/`name.ru` при каждом прогоне,
+   id не гарантированы стабильными). Company-wide план = сумма `sales_target`
+   этих 3 point-ов напрямую из `points[]`. Личный план менеджера = сумма его
+   `sales_target` из `POST /api/crm/plans/manager-channels` для этих же 3
+   point_id (не для всех каналов, где он назначен — старая версия этого пункта
+   ошибочно суммировала весь конвейер). 9 запросов на 3 периода (1×monthly +
+   3×manager-channels на период), не 23. Импорт — `PUT /api/v1/period-targets`
+   (личные `mgr:<UUID>:<период>` + план компании без префикса). Сумма личных
+   планов НЕ обязана совпадать с company-wide — не уравнивать искусственно.
+6. **Причины отказа** — §6. `POST /decline-reasons/import`. Fire-and-forget
+   (166 запросов на частичный август = ~11 минут, растёт пропорционально
+   дням месяца) — тянет диапазон «1 число текущего месяца → сегодня» по
+   воронке `pineline_id=91` («Отдел первичных продаж»), апсерт заменяет весь
+   срез manager+period+pipeline целиком (не накопление).
 
 После каждого источника — сверка по чек-листу того раздела (например §1.7
 для рекламы). Только когда все применимые источники обновлены (или явно

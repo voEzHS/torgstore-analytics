@@ -116,7 +116,14 @@ async def get_manager_discounts(manager_id: str, period: Optional[str] = None, d
 
 @router.get("")
 async def list_all_manager_discounts(period: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    query = select(ManagerDiscount, Manager).join(Manager, Manager.id == ManagerDiscount.manager_id)
+    # Фильтр Manager.is_active — тот же класс бага, что в invoices.py/decline_reasons.py
+    # (аудит 11.08.2026), профилактически на случай данных у будущих деактивированных
+    # менеджеров, даже если на 11.08.2026 сирот здесь не найдено.
+    query = (
+        select(ManagerDiscount, Manager)
+        .join(Manager, Manager.id == ManagerDiscount.manager_id)
+        .where(Manager.is_active == True)
+    )
     if period:
         query = query.where(ManagerDiscount.period == period)
     result = await db.execute(query)
