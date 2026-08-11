@@ -2,7 +2,7 @@
 SQLAlchemy ORM модели — отражают схему БД из migrations/001_initial_schema.sql
 """
 from sqlalchemy import (
-    Column, String, Numeric, Boolean, Integer, Text,
+    Column, String, Numeric, Boolean, Integer, BigInteger, Text,
     ForeignKey, ARRAY, UniqueConstraint, Index
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
@@ -347,6 +347,30 @@ class DeclineReasonStats(Base):
     created_at    = Column(TIMESTAMP(timezone=True), server_default=func.now())
     # onupdate — см. комментарий у InvoiceStats.updated_at выше (тот же баг).
     updated_at    = Column(TIMESTAMP(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DeclineReasonLeadCache(Base):
+    """
+    Внутренний кеш скрипта выгрузки Причин отказа (§6.3 crm-import-runbook.md,
+    12.08.2026) — lead_id уже прочитанных лидов, чтобы дельта-выгрузка не
+    перечитывала leads/details по одному и тому же лиду каждый день заново
+    (причина отказа финальна с момента перевода лида в «Не реализовано»).
+    НЕ читается ни decline_reasons.py публичными эндпоинтами витрины, ни
+    фронтендом — используется только парой /decline-reasons/cache/*
+    эндпоинтов ниже, перед тем как решить, какие lead_id реально идти
+    запрашивать в CRM. Не путать с DeclineReasonStats (агрегированная
+    витрина для сайта, её контракт этой таблицей не меняется).
+    См. migrations/011_add_decline_reason_lead_cache.sql.
+    """
+    __tablename__ = "decline_reason_lead_cache"
+
+    lead_id         = Column(BigInteger, primary_key=True)  # CRM lead.id — числовое CRM-пространство, НЕ UUID сайта
+    manager_id      = Column(UUID(as_uuid=True), ForeignKey("managers.id"), nullable=False)
+    reason          = Column(Text, nullable=False)
+    pipeline        = Column(Text, default="Отдел первичных продаж")
+    lead_created_at = Column(TIMESTAMP(timezone=True))
+    fetched_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    created_at      = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 
 class ManagerDiscount(Base):

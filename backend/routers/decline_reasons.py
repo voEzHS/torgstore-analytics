@@ -12,17 +12,27 @@ POST /api/v1/decline-reasons/import — сохранить срез причин
      это снэпшот выборки, а не накопительный счётчик)
 GET  /api/v1/decline-reasons/{manager_id} — прочитать причины менеджера
 GET  /api/v1/decline-reasons — прочитать все (для сводной секции/аналитики)
+
+POST /api/v1/decline-reasons/cache/lookup — дельта-выгрузка (12.08.2026, см.
+     crm-import-runbook.md §6.3): по списку CRM lead_id вернуть, у каких уже
+     есть закешированная причина (decline_reason_lead_cache) — скрипт сбора
+     данных запрашивает у CRM leads/details ТОЛЬКО те lead_id, которых нет в
+     ответе, вместо того чтобы каждый день перечитывать весь месяц заново.
+     Никак не связано с decline_reason_stats/её контрактом.
+POST /api/v1/decline-reasons/cache/upsert — записать в кеш свежепрочитанные
+     (lead_id → reason) пары после того, как скрипт реально сходил в CRM.
 """
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.database import get_db
-from backend.models.models import DeclineReasonStats, Manager
+from backend.models.models import DeclineReasonLeadCache, DeclineReasonStats, Manager
 from backend.routers.imports import parse_period
 
 router = APIRouter(prefix="/decline-reasons", tags=["Decline Reasons"])
@@ -144,3 +154,74 @@ async def list_all_decline_reasons(period: Optional[str] = None, db: AsyncSessio
         }
         for r, mgr in result.all()
     ]
+
+
+class CacheLookupIn(BaseModel):
+    lead_ids: List[int] = []
+
+
+@router.post("/cache/lookup")
+async def lookup_decline_reason_cache(body: CacheLookupIn, db: AsyncSession = Depends(get_db)):
+    """
+    Дельта-выгрузка, шаг 1: из присланного списка CRM lead_id вернуть только
+    те, для которых уже есть закешированная причина — скрипт §6.3 после этого
+    идёт в CRM ТОЛЬКО за отсутствующими здесь lead_id (причина отказа
+    финальна с момента перевода лида в «Не реализовано», поэтому повторное
+    чтение уже закешированных не нужно). Не трогает decline_reason_stats.
+    """
+    if not body.lead_ids:
+        return {"cached": {}}
+    result = await db.execute(
+        select(DeclineReasonLeadCache).where(DeclineReasonLeadCache.lead_id.in_(body.lead_ids))
+    )
+    rows = result.scalars().all()
+    return {"cached": {str(r.lead_id): r.reason for r in rows}}
+
+
+class CacheUpsertRow(BaseModel):
+    lead_id: int
+    manager_id: str
+    reason: str
+    pipeline: str = "Отдел первичных продаж"
+    lead_created_at: Optional[str] = None
+
+
+class CacheUpsertIn(BaseModel):
+    rows: List[CacheUpsertRow] = []
+
+
+@router.post("/cache/upsert")
+async def upsert_decline_reason_cache(body: CacheUpsertIn, db: AsyncSession = Depends(get_db)):
+    """
+    Дельта-выгрузка, шаг 2: после того, как скрипт §6.3 реально сходил в CRM
+    за новыми (некешированными) lead_id, записать результат сюда — чтобы
+    следующий ежедневный прогон их больше не перечитывал. lead_id — PK,
+    ON CONFLICT DO UPDATE (на случай, если причина у лида когда-либо
+    поменяется — перезаписываем, а не игнорируем повтор молча).
+    """
+    saved = 0
+    for row in body.rows:
+        try:
+            mgr_id = uuid.UUID(row.manager_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"Неверный manager_id: {row.manager_id}")
+        stmt = pg_insert(DeclineReasonLeadCache).values(
+            lead_id=row.lead_id,
+            manager_id=mgr_id,
+            reason=row.reason,
+            pipeline=row.pipeline,
+            lead_created_at=row.lead_created_at,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[DeclineReasonLeadCache.lead_id],
+            set_={
+                "manager_id": mgr_id,
+                "reason": row.reason,
+                "pipeline": row.pipeline,
+                "lead_created_at": row.lead_created_at,
+            },
+        )
+        await db.execute(stmt)
+        saved += 1
+    await db.commit()
+    return {"upserted": saved}

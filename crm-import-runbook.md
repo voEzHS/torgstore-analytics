@@ -45,18 +45,36 @@
 НЕНАДЁЖНЫМ способом гарантировать паузу и БОЛЬШЕ НЕ используется нигде в
 этом документе.**
 
-### v3 (текущий, действующий метод) — явная пауза внутри самой функции запроса
+### v3 (08-11.08.2026) — явная пауза внутри самой функции запроса — ЗАМЕНЕНА v4, см. ниже
 
-Вместо перехвата глобальных объектов — обычная функция с ЖЁСТКО зашитой
-паузой 3с ПЕРЕД КАЖДЫМ запросом, без исключений (в том числе перед первым
-запросом в новом вызове `javascript_tool`). Гарантия строится на голой
-JS-семантике `await`/`setTimeout` внутри одного выполнения скрипта — не
-зависит ни от какого состояния, которое должно "пережить" границу между
-вызовами инструмента:
+v3 держала паузу через `await sleep(3000)` перед каждым запросом, но
+самопроверку (`gaps.every(g=>g>=2.9)`) считала ТОЛЬКО в конце всего цикла —
+т.е. если бы `sleep` был сломан (баг в будущей правке, случайность), весь
+цикл (вплоть до 187 запросов) успел бы уйти на полной скорости ДО того, как
+кто-то заметил нарушение. Это не гипотетический риск: именно этот паттерн
+(нарушение обнаружено постфактум, а не остановлено в моменте) уже привёл к
+реальному инциденту v1 08.08.2026 (119 запросов за 137с). Найдено и заменено
+12.08.2026 по прямому запросу пользователя («остановить МОМЕНТАЛЬНО»).
+
+### v4 (текущий, действующий метод, с 12.08.2026) — блокировка ДО отправки, не аудит после
+
+Дополнительно к паузе `sleep(3000)` (она остаётся — это первая линия
+защиты) добавлена вторая, независимая линия: проверка гэпа с предыдущим
+реальным запросом ПРЯМО ПЕРЕД `fetch`, не после цикла. Если гэп < 2.9с —
+`throw` происходит ДО строки с `fetch` — проблемный запрос физически НЕ
+уходит в сеть, ни разу, даже если `sleep` почему-то не сработал:
 
 ```js
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null; // переживает границы javascript_tool (обычное свойство window, не monkey-patch fetch/XHR — тот способ, v1/v2, признан ненадёжным, см. историю выше)
+
 async function crmGet(url){
-  await new Promise(r => setTimeout(r, 3000)); // ВСЕГДА первым делом — без исключений, без пропуска первого запроса, без проверки "прошло ли уже 3с"
+  await new Promise(r => setTimeout(r, 3000)); // первая линия защиты — не убирать
+  const now = Date.now();
+  if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    // вторая линия защиты — блокирует ОТПРАВКУ, а не констатирует нарушение постфактум
+    throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+  }
+  window.__lastCrmFireAt = now;
   const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
   return await r.json();
 }
@@ -66,30 +84,32 @@ async function crmGet(url){
 1. Все запросы к CRM идут ТОЛЬКО через `crmGet(url)`, никогда напрямую через
    `fetch`.
 2. Только `for...of` с `await crmGet(...)` внутри цикла. **НИКОГДА**
-   `Promise.all`/`Promise.race`/`.map()` без последовательного await —
-   параллельный запуск сломает паузу даже в v3, потому что каждый вызов
-   независимо ждёт свои 3с и потом все fetch уходят почти одновременно.
-3. Функцию `crmGet` копировать целиком в НАЧАЛО каждого отдельного вызова
-   `javascript_tool`, где будут запросы к CRM — не полагаться на то, что она
-   уже определена из предыдущего вызова.
-4. В конце скрипта, который делает несколько запросов, — самопроверка:
-   ```js
-   // timestamps — массив Date.now(), записанный сразу после каждого crmGet
-   const gaps = timestamps.slice(1).map((t,i) => (t - timestamps[i]) / 1000);
-   if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
-   ```
-   Если самопроверка кидает ошибку — остановиться и сообщить пользователю,
-   а не продолжать выгрузку молча.
+   `Promise.all`/`Promise.race`/`.map()` без последовательного await — при
+   параллельном запуске каждый вызов независимо считает свой `now` и все
+   fetch всё равно уйдут почти одновременно, даже с v4-проверкой.
+3. Функцию `crmGet` (вместе со строкой инициализации `window.__lastCrmFireAt`)
+   копировать целиком в НАЧАЛО каждого отдельного вызова `javascript_tool`,
+   где будут запросы к CRM — не полагаться на то, что она уже определена из
+   предыдущего вызова. Сама переменная `window.__lastCrmFireAt` (в отличие от
+   функции) переживает границу между вызовами сама — инициализация через `??`
+   просто не даёт её случайно затереть повторным `= null`.
+4. `window.__lastCrmFireAt` — ОДИН на весь таб CRM, общий для ВСЕХ источников
+   (Сквозная/Накладные/Скидки/Товарка/Причины отказа/Планы) — значит защищён
+   и стык МЕЖДУ разными источниками в рамках одной сессии, не только внутри
+   одного цикла, как было в v3.
+5. Старая пост-цикловая самопроверка (см. v3 выше) остаётся как ОТЧЁТНОСТЬ
+   (сколько реально было гэпов, для лога), но защитой больше не является —
+   ей не нужно доверять, реальная защита — в самом `crmGet`.
 
-**Живой тест 08.08.2026** (2 реальных запроса к `total-sum-ajax`, ОДИН вызов
-`javascript_tool`, без Promise.all): `totalSeconds=7.365`, `gap=3.743с` —
-подтверждено ≥3с против настоящего CRM. В отличие от v1/v2 гарантия здесь не
-зависит от того, пережило ли что-то границу между вызовами инструмента —
-функция самодостаточна на каждый отдельный вызов.
+**Живой тест 12.08.2026** (эмуляция сломанного `sleep`, 300мс вместо 3000мс,
+без реальных запросов к CRM — см. переписку с пользователем): 2-й вызов
+корректно заблокирован ДО симулированной отправки (`fetchCallCount` остался
+на 1, не вырос до 2), `errMsg` содержит `RATE LIMIT VIOLATION`. Подтверждено:
+блокировка срабатывает раньше сети, а не после.
 
 Если это делает агент через браузерную автоматизацию (Claude in Chrome) —
 первым действием в любом скрипте, который обращается к torgstore.zymyran.com,
-идёт определение `crmGet` (см. выше), и только потом сами запросы.
+идёт определение `crmGet` v4 (см. выше), и только потом сами запросы.
 
 ## 1. Сквозная аналитика (реклама/UTM) — основная выгрузка
 
@@ -377,9 +397,15 @@ city)` — то есть новая строка с ДРУГОЙ меткой к
 ### 2.2 Готовый скрипт v3 (консоль вкладки CRM) — crmGet копировать целиком в начало КАЖДОГО отдельного вызова javascript_tool, см. §0
 
 ```js
-// v3 — см. §0. Пауза 3с зашита безусловно перед КАЖДЫМ запросом.
+// v4 — см. §0. Пауза 3с + блокировка ДО отправки, если гэп < 2.9с.
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
 async function crmGet(url, opts){
   await new Promise(r => setTimeout(r, 3000));
+  const now = Date.now();
+  if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+  }
+  window.__lastCrmFireAt = now;
   const r = await fetch(url, Object.assign({headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}}, opts||{}));
   return await r.json();
 }
@@ -663,10 +689,16 @@ discount_amount_чистый = totalSumWithoutDiscount(sp=0)  - Σ totalSumWitho
 ```js
 const UCENKA_IDS = [27, 29, 228, 236, 243, 577];
 
-// v3 — см. §0. НЕ полагается на перехват fetch/XHR (v1/v2 признаны ненадёжными).
-// Пауза 3с зашита прямо здесь, безусловно, перед КАЖДЫМ запросом.
+// v4 — см. §0. НЕ полагается на перехват fetch/XHR (v1/v2 признаны ненадёжными).
+// Пауза 3с + блокировка ДО отправки, если гэп < 2.9с (вторая, независимая линия защиты).
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
 async function crmGet(url){
   await new Promise(r => setTimeout(r, 3000));
+  const now = Date.now();
+  if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+  }
+  window.__lastCrmFireAt = now;
   const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
   return await r.json();
 }
@@ -921,14 +953,21 @@ async function waitButtonIdle(btn, timeoutMs) {
 
 // clickLog — общий массив, куда КАЖДЫЙ клик (включая повторные попытки) пишет свой timestamp,
 // чтобы самопроверка правила §0 покрывала реальные сетевые события, а не только успешные
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
 async function extractOne(crmId, clickLog, attempt) {
   attempt = attempt || 1;
   const s = document.querySelector('select[name="manager_id"]');
   s.value = crmId;
   s.dispatchEvent(new Event('change', {bubbles:true}));
 
-  // ПРАВИЛО §0: ≥3с ВСЕГДА перед единственным сетевым действием (клик) — без исключений, в том числе перед повтором
+  // ПРАВИЛО §0 v4: ≥3с ВСЕГДА перед единственным сетевым действием (клик) — без исключений, в том числе перед повтором
   await new Promise(r => setTimeout(r, 3500));
+  // v4 — блокировка ДО клика, если гэп с прошлым CRM-запросом (любого источника) < 2.9с
+  const __now = Date.now();
+  if (window.__lastCrmFireAt !== null && (__now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    throw new Error('RATE LIMIT VIOLATION — клик ЗАБЛОКИРОВАН ДО отправки, gap=' + ((__now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, crmId=' + crmId);
+  }
+  window.__lastCrmFireAt = __now;
   const btn = Array.from(document.querySelectorAll('button')).find(b => b.textContent.trim().startsWith('Поиск'));
   clickLog.push(Date.now());
   btn.click();
@@ -1147,13 +1186,30 @@ per-лид кастомное поле, эндпоинт №1 (список) е�
 `Runtime.evaluate`, та же ловушка, что в §2.5.1/§2.3) — НЕ `await`-ить цикл
 из 166+ запросов одним вызовом `javascript_tool`.
 
-### 6.3 Готовый скрипт v3 (консоль вкладки CRM)
+### 6.3 Готовый скрипт v4 (дельта-кеш, 12.08.2026 — см. §6.3.1 для контекста)
 
-**Шаг 1 — собрать список «отказных» лидов периода** (обычный `await`-вызов,
-4 страницы укладываются в лимит одного вызова инструмента):
+⚠️ С 12.08.2026 этот раздел использует `decline_reason_lead_cache`
+(`migrations/011_add_decline_reason_lead_cache.sql`,
+`POST /decline-reasons/cache/lookup`/`upsert`) — Шаг 2 (реальные CRM-запросы,
+самая дорогая часть) теперь идёт ТОЛЬКО по лидам, которых ещё нет в кеше, а
+не по всему месяцу заново каждый день. Раньше (v3, до 12.08.2026): 187
+запросов на 11-й день августа. С кешем: 4 (список) + ~15-20 (только новые
+лиды за день). См. §6.3.1 ниже про то, почему это безопасно (причина отказа
+финальна) и что кеш НЕ трогает `decline_reason_stats`/её контракт.
+
+**Шаг 1 (Таб A, CRM) — собрать список «отказных» лидов периода** (обычный
+`await`-вызов, 4 страницы укладываются в лимит одного вызова инструмента) —
+БЕЗ ИЗМЕНЕНИЙ относительно v3, но теперь дампим список сразу, он нужен на
+Табе B на Шаге 1.5:
 ```js
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
 async function crmGet(url, opts){
   await new Promise(r => setTimeout(r, 3000));
+  const now = Date.now();
+  if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+  }
+  window.__lastCrmFireAt = now;
   const r = await fetch(url, Object.assign({headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}}, opts||{}));
   return await r.json();
 }
@@ -1180,45 +1236,74 @@ if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.
 // хранит время):
 const DATE_FROM = '2026-08-01', DATE_TO_EXCLUSIVE = '2026-08-11';
 window.__periodLostLeads = allLeads.filter(l => l.created_at && l.created_at >= DATE_FROM && l.created_at < DATE_TO_EXCLUSIVE);
-JSON.stringify({totalPages, totalFetched: allLeads.length, gaps, periodCount: window.__periodLostLeads.length});
-```
 
-**Шаг 2 — fire-and-forget по каждому лиду периода** (глобальный
-`__reasonAuditLog`, самопроверка на ВЕСЬ прогон целиком — тот же паттерн,
-что в §2.3):
+document.body.innerHTML = '<pre id="__dump"></pre>';
+document.getElementById('__dump').textContent = JSON.stringify(window.__periodLostLeads);
+'dumped periodLostLeads, count=' + window.__periodLostLeads.length + ', gaps=' + JSON.stringify(gaps);
+```
+затем `get_page_text` на этом же табе, чтобы забрать полный `periodLostLeads`
+(⚠️ это уничтожает DOM таба CRM, как и раньше на аналогичных шагах — для
+Шага 2 понадобится либо тот же таб после `navigate()`-перезагрузки страницы
+списка, либо просто помнить, что `window.__periodLostLeads` внутри ЭТОГО
+таба всё ещё жив в памяти, если вкладку не перезагружали — `innerHTML=...`
+не убивает `window.*`, только видимый DOM).
+
+**Шаг 1.5 (Таб B, сайт) — узнать, что уже есть в кеше, отфильтровать «новые»:**
 ```js
+const periodLostLeads = /* JSON.parse(...) текста из Шага 1 */;
+const lookupResp = await fetch('/api/v1/decline-reasons/cache/lookup', {
+  method: 'POST', headers: {'Content-Type':'application/json'},
+  body: JSON.stringify({ lead_ids: periodLostLeads.map(l => l.id) }),
+});
+const { cached } = await lookupResp.json(); // {"<lead_id>": "<reason>", ...}
+const cachedIds = new Set(Object.keys(cached).map(Number));
+window.__newLeadIds = periodLostLeads.filter(l => !cachedIds.has(l.id)).map(l => l.id);
+window.__cachedReasons = cached; // сохраняем на этом табе для Шага 4
+JSON.stringify({ totalLeads: periodLostLeads.length, alreadyCached: cachedIds.size, newToFetch: window.__newLeadIds.length, newLeadIdsPreview: window.__newLeadIds.slice(0, 20) });
+```
+`window.__newLeadIds` — это и есть реальная экономия: обычно 15-20 вместо
+150-550+. Именно этот (короткий) список идёт в Шаг 2 на Таб A, а не весь
+`periodLostLeads`.
+
+**Шаг 2 (Таб A, CRM) — fire-and-forget ТОЛЬКО по новым лидам** (вставить
+`window.__newLeadIds` из Шага 1.5 литералом — `window.*` не переживает
+переход между табами, см. известную ловушку в разделе про архитектуру):
+```js
+const NEW_LEAD_IDS = [/* .. вставить window.__newLeadIds из Шага 1.5 .. */];
+
 window.__reasonProgress = 0;
-window.__reasonTotal = window.__periodLostLeads.length;
+window.__reasonTotal = NEW_LEAD_IDS.length;
 window.__reasonDone = false;
 window.__reasonError = null;
 window.__reasonGaps = null;
-window.__reasonAgg = null;
+window.__reasonAgg = null; // теперь {lead_id: reason}, НЕ агрегат по менеджеру — агрегация переехала на Шаг 4 (Таб B)
 window.__reasonAuditLog = [];
 
 (async () => {
   try {
+    window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
     async function crmGet(url){
       await new Promise(r => setTimeout(r, 3000));
-      window.__reasonAuditLog.push(Date.now());
+      const now = Date.now();
+      if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+        throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+      }
+      window.__lastCrmFireAt = now;
+      window.__reasonAuditLog.push(now);
       const r = await fetch(url, {headers:{'Accept':'application/json','X-Requested-With':'XMLHttpRequest'}});
       return await r.json();
     }
-    const agg = {}; // manager_id -> {manager_name, reasons: {reason: count}, sample_size}
-    for (const lead of window.__periodLostLeads) {
-      const j = await crmGet(`/api/crm/leads/details?lead_id=${lead.id}`);
+    const freshReasons = {}; // lead_id -> reason
+    for (const leadId of NEW_LEAD_IDS) {
+      const j = await crmGet(`/api/crm/leads/details?lead_id=${leadId}`);
       const cf = (j.data && j.data.custom_fields || []).find(f => f.id === 9);
-      const reason = (cf && cf.value) ? cf.value : 'Не указана';
-      const mgrId = lead.manager_id || 'unknown';
-      const mgrName = lead.manager_name || 'Неизвестно';
-      if (!agg[mgrId]) agg[mgrId] = {manager_name: mgrName, reasons: {}, sample_size: 0};
-      agg[mgrId].reasons[reason] = (agg[mgrId].reasons[reason] || 0) + 1;
-      agg[mgrId].sample_size++;
+      freshReasons[leadId] = (cf && cf.value) ? cf.value : 'Не указана';
       window.__reasonProgress++;
     }
     const gaps = window.__reasonAuditLog.slice(1).map((t,i) => (t - window.__reasonAuditLog[i]) / 1000);
     if (!gaps.every(g => g >= 2.9)) throw new Error('RATE LIMIT VIOLATION: ' + JSON.stringify(gaps));
     window.__reasonGaps = gaps;
-    window.__reasonAgg = agg;
+    window.__reasonAgg = freshReasons;
     window.__reasonDone = true;
   } catch (e) {
     window.__reasonError = String(e);
@@ -1227,27 +1312,98 @@ window.__reasonAuditLog = [];
 })();
 JSON.stringify({started: true, total: window.__reasonTotal});
 ```
+Если `NEW_LEAD_IDS.length === 0` (весь период уже в кеше — реалистично для
+повторного прогона в один день) — пропустить Шаг 2/2b целиком, сразу перейти
+к Шагу 3 с `window.__reasonAgg = {}`.
 
-**Шаг 2b — опрос** (каждые ~60-90с, полный прогон на 150-550+ лидов ≈
-10-40 минут):
+**Шаг 2b — опрос** (каждые ~15-30с — список теперь короткий, полный прогон
+на 15-20 новых лидов ≈ 1-2 минуты, не 10-40 как раньше):
 ```js
 JSON.stringify({progress: window.__reasonProgress, total: window.__reasonTotal, done: window.__reasonDone, error: window.__reasonError, gaps: window.__reasonGaps});
 ```
 Если `error` не `null` — остановиться, не импортировать частичные данные,
 см. §0.
 
-**Шаг 3 — забрать агрегат без обрезки:**
+**Шаг 3 (Таб A) — забрать свежепрочитанные {lead_id: reason} без обрезки:**
 ```js
 document.body.innerHTML = '<pre id="__dump"></pre>';
 document.getElementById('__dump').textContent = JSON.stringify(window.__reasonAgg);
-'dumped, length=' + document.getElementById('__dump').textContent.length;
+'dumped freshReasons, length=' + document.getElementById('__dump').textContent.length;
 ```
-затем `get_page_text` на этом же табе. Дальше по нужному менеджеру
-преобразовать `{manager_name, reasons:{...}, sample_size}` в payload из
-начала §6 (`reasons` — массив `{reason, count}` из `Object.entries`) и
-отправить построчно на Табе B — `manager_id` (UUID сайта) сопоставлять по
-имени со списком `GET /api/v1/managers` (как в §2.3), НЕ по CRM `manager_id`
-из ответа (числовое CRM-пространство, не совпадает с UUID сайта).
+затем `get_page_text` на этом же табе.
+
+**Шаг 4 (Таб B, сайт) — обновить кеш и импортировать как раньше** (контракт
+`/decline-reasons/import` НЕ меняется):
+```js
+const periodLostLeads = /* тот же массив, что и в Шаге 1.5 */;
+const cachedReasons = window.__cachedReasons; // из Шага 1.5, тот же таб
+const freshReasons = /* JSON.parse(...) текста из Шага 3, {lead_id: reason} */;
+
+const mgrs = await fetch('/api/v1/managers').then(r => r.json());
+function norm(s){ return String(s||'').replace(/\s+/g,' ').trim().toLowerCase(); }
+const byName = {}; mgrs.forEach(m => byName[norm(m.name)] = m.id);
+
+// 4a — обновить кеш ТОЛЬКО свежепрочитанными (кешированные трогать не нужно)
+const cacheRows = [];
+for (const lead of periodLostLeads) {
+  if (!(lead.id in freshReasons)) continue; // не среди новых — уже был в кеше
+  const mgrId = byName[norm(lead.manager_name)];
+  if (!mgrId) continue; // несопоставленный менеджер (напр. уволенный) — не кешируем, повторим попытку сопоставить в след. раз
+  cacheRows.push({ lead_id: lead.id, manager_id: mgrId, reason: freshReasons[lead.id], pipeline: 'Отдел первичных продаж', lead_created_at: lead.created_at });
+}
+if (cacheRows.length) {
+  await fetch('/api/v1/decline-reasons/cache/upsert', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ rows: cacheRows }),
+  });
+}
+
+// 4b — агрегировать ВСЕ лиды периода (кеш + свежие) по менеджеру, как раньше
+const agg = {}; // site manager_id -> {manager_name, reasons:{reason:count}, sample_size}
+for (const lead of periodLostLeads) {
+  const mgrId = byName[norm(lead.manager_name)];
+  if (!mgrId) continue; // см. §6 — несопоставленные (уволенные) менеджеры пропускаются, как и раньше
+  const reason = freshReasons[lead.id] ?? cachedReasons[String(lead.id)] ?? 'Не указана';
+  if (!agg[mgrId]) agg[mgrId] = { manager_name: lead.manager_name, reasons: {}, sample_size: 0 };
+  agg[mgrId].reasons[reason] = (agg[mgrId].reasons[reason] || 0) + 1;
+  agg[mgrId].sample_size++;
+}
+
+// 4c — импорт, ТОТ ЖЕ эндпоинт/контракт, что и в v3
+const results = [];
+for (const [mgrId, data] of Object.entries(agg)) {
+  const r = await fetch('/api/v1/decline-reasons/import', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      manager_id: mgrId, period: 'Август 2026', pipeline: 'Отдел первичных продаж',
+      sample_size: data.sample_size,
+      reasons: Object.entries(data.reasons).map(([reason, count]) => ({ reason, count })),
+    }),
+  });
+  results.push({ manager: data.manager_name, status: r.status, ok: r.ok });
+}
+JSON.stringify(results);
+```
+
+### 6.3.1 Почему кеш безопасен (не «упадёт»)
+
+- Причина отказа — поле, которое CRM требует заполнить `required_from_stage`
+  = «Не реализовано» (см. §6.1) и не даёт менять после — на практике
+  наблюдений о задней смене причины не было ни разу за все прогоны
+  10-12.08.2026. Если это когда-либо не так — исправление тривиальное:
+  `ON CONFLICT DO UPDATE` в `/cache/upsert` уже перезаписывает значение, если
+  лид когда-нибудь попадёт в `NEW_LEAD_IDS` повторно (например, вручную
+  почистить кеш для конкретного `lead_id`).
+- `decline_reason_stats` (таблица-витрина, которую читают эндпоинты
+  `/decline-reasons/{manager_id}` и `/decline-reasons`, и весь фронтенд) —
+  НЕ изменена этим разделом. `POST /decline-reasons/import` как принимал,
+  так и принимает тот же payload, что и в v3 — снэпшот-замена по
+  `(manager_id, period, pipeline)`. Кеш — это отдельная, новая таблица
+  (`decline_reason_lead_cache`), которую никто, кроме этого скрипта, не
+  читает.
+- Если `/cache/lookup` вернёт пустой `{cached:{}}` (например, кеш ещё не
+  наполнен — первый прогон после миграции) — `NEW_LEAD_IDS` станет равен
+  всему `periodLostLeads`, то есть скрипт ведёт себя ТОЧНО как старый v3 —
+  деградация плавная, не ломается.
 
 ---
 
@@ -1340,6 +1496,24 @@ POST /api/crm/plans/manager-channels
 сужение до минимального набора не стал, суперсет надёжен и стабилен:
 
 ```js
+// crmPost — версия crmGet v4 для POST-запросов (см. §0). Раньше в этом разделе
+// crmPost использовался без определения — добавлено 12.08.2026 при ретрофите v4.
+window.__lastCrmFireAt = window.__lastCrmFireAt ?? null;
+async function crmPost(url, body){
+  await new Promise(r => setTimeout(r, 3000));
+  const now = Date.now();
+  if (window.__lastCrmFireAt !== null && (now - window.__lastCrmFireAt) / 1000 < 2.9) {
+    throw new Error('RATE LIMIT VIOLATION — запрос ЗАБЛОКИРОВАН ДО отправки, gap=' + ((now - window.__lastCrmFireAt) / 1000).toFixed(3) + 'с, url=' + url);
+  }
+  window.__lastCrmFireAt = now;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {'Accept':'application/json','X-Requested-With':'XMLHttpRequest','Content-Type':'application/json'},
+    body: JSON.stringify(body),
+  });
+  return await r.json();
+}
+
 const commonBody = {
   pineline_id: 91, month: 8, year: 2026, period: "2026-08",
   date: "2026-08-01", date_from: "2026-08-01", date_to: "2026-08-31"
