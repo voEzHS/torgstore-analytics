@@ -23,6 +23,7 @@ POST /api/v1/decline-reasons/cache/upsert — записать в кеш све�
      (lead_id → reason) пары после того, как скрипт реально сходил в CRM.
 """
 import uuid
+from datetime import datetime
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -183,7 +184,11 @@ class CacheUpsertRow(BaseModel):
     manager_id: str
     reason: str
     pipeline: str = "Отдел первичных продаж"
-    lead_created_at: Optional[str] = None
+    # Optional[datetime], НЕ str — колонка TIMESTAMPTZ, asyncpg не биндит сырую
+    # строку в этот тип напрямую (баг найден живым тестом 12.08.2026: 500
+    # Internal Server Error на upsert с ISO-строкой). Pydantic сам парсит
+    # ISO 8601 в datetime — тот же паттерн, что в decisions.py:postpone_until.
+    lead_created_at: Optional[datetime] = None
 
 
 class CacheUpsertIn(BaseModel):
