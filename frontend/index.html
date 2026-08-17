@@ -1828,6 +1828,17 @@ select.combo-native-hidden {
 .hero-kpi-delta.up { color: var(--green); }
 .hero-kpi-delta.dn { color: var(--red); }
 
+/* Same-period informational note (NOT a vs-previous-period delta) — visually
+   distinct from .hero-kpi-delta so it doesn't read as a comparison metric,
+   e.g. "Проиграно" card's "X ещё в работе" line. */
+.hero-kpi-note {
+  font-size: 11px;
+  font-weight: 500;
+  font-style: italic;
+  color: var(--muted);
+  opacity: .85;
+}
+
 /* KPI delta badges */
 .kpi-delta {
   font-size: 10px;
@@ -4801,6 +4812,16 @@ function kpi(label,val,vcls,sub,scls,delta,rawNum,fmtType){
 
 // Рендерим hero-секцию — большой экран с главными цифрами
 function renderHero(T, Tp, pt, sess, sl, slPct, convCls, lbl, delta){
+  // PP-дельта для конверсии — разница в процентных пунктах, а не относительный
+  // % (относительный % на ставке даёт абсурдные "+156%" при небольшом сдвиге
+  // ставки на маленькой выборке). И честная подпись базы сравнения для
+  // Лидов/Продаж: сравниваем текущий (возможно неполный) период с ПОЛНЫМ
+  // предыдущим месяцем без поправки на прошедшие дни — это стоит подписывать,
+  // а не молча показывать голый %.
+  const deltaPP = (cur, prev) => (Tp && prev!=null && cur!=null) ? (cur-prev) : null;
+  const prevMonthIdx = MONTHS.indexOf(sess.period) - 1;
+  const prevMonthShort = prevMonthIdx >= 0 ? MONTHS[prevMonthIdx].split(' ')[0].toLowerCase() : null;
+
   // Скоуп: «Весь отдел» (sess.mgrId===null) vs конкретный менеджер. ДО этой правки здесь
   // ВСЕГДА бралось DEPT_MGR_ID и periodTargets (план/выручка отдела), даже если в «Кто» выбран
   // конкретный человек — карточка «Общая сумма продаж» у него молча показывала цифры всего
@@ -4940,17 +4961,17 @@ function renderHero(T, Tp, pt, sess, sl, slPct, convCls, lbl, delta){
       <div class="card hero-kpi">
         <div class="hero-kpi-val" data-num="${n(T.leads)}">${fmt(n(T.leads))}</div>
         <div class="hero-kpi-label"><span class="kpi-icon-chip hero-kpi-chip kpi-icon-blue"><i class="ti ti-users"></i></span>Лидов</div>
-        ${delta(n(T.leads),n(Tp?.leads))!==null?`<div class="hero-kpi-delta ${delta(n(T.leads),n(Tp?.leads))>=0?'up':'dn'}">${delta(n(T.leads),n(Tp?.leads))>=0?'↑':'↓'} ${Math.abs(delta(n(T.leads),n(Tp?.leads))).toFixed(0)}%</div>`:''}
+        ${delta(n(T.leads),n(Tp?.leads))!==null?`<div class="hero-kpi-delta ${delta(n(T.leads),n(Tp?.leads))>=0?'up':'dn'}">${delta(n(T.leads),n(Tp?.leads))>=0?'↑':'↓'} ${Math.abs(delta(n(T.leads),n(Tp?.leads))).toFixed(0)}%${prevMonthShort?` <span style="opacity:.6;font-weight:400;font-style:italic">vs весь ${prevMonthShort}</span>`:''}</div>`:''}
       </div>
       <div class="card hero-kpi">
         <div class="hero-kpi-val" data-num="${n(T.deals)}">${fmt(n(T.deals))}</div>
         <div class="hero-kpi-label"><span class="kpi-icon-chip hero-kpi-chip kpi-icon-green"><i class="ti ti-shopping-cart"></i></span>Продаж</div>
-        ${delta(n(T.deals),n(Tp?.deals))!==null?`<div class="hero-kpi-delta ${delta(n(T.deals),n(Tp?.deals))>=0?'up':'dn'}">${delta(n(T.deals),n(Tp?.deals))>=0?'↑':'↓'} ${Math.abs(delta(n(T.deals),n(Tp?.deals))).toFixed(0)}%</div>`:''}
+        ${delta(n(T.deals),n(Tp?.deals))!==null?`<div class="hero-kpi-delta ${delta(n(T.deals),n(Tp?.deals))>=0?'up':'dn'}">${delta(n(T.deals),n(Tp?.deals))>=0?'↑':'↓'} ${Math.abs(delta(n(T.deals),n(Tp?.deals))).toFixed(0)}%${prevMonthShort?` <span style="opacity:.6;font-weight:400;font-style:italic">vs весь ${prevMonthShort}</span>`:''}</div>`:''}
       </div>
       <div class="card hero-kpi">
         <div class="hero-kpi-val ${convCls}" data-num="${n(T.conv)}" data-fmt="pct">${fmtC(T.conv)}</div>
         <div class="hero-kpi-label"><span class="kpi-icon-chip hero-kpi-chip kpi-icon-amber"><i class="ti ti-percentage"></i></span>Конверсия</div>
-        ${delta(n(T.conv),n(Tp?.conv))!==null?`<div class="hero-kpi-delta ${delta(n(T.conv),n(Tp?.conv))>=0?'up':'dn'}">${delta(n(T.conv),n(Tp?.conv))>=0?'↑':'↓'} ${Math.abs(delta(n(T.conv),n(Tp?.conv))).toFixed(1)}%</div>`:''}
+        ${deltaPP(n(T.conv),n(Tp?.conv))!==null?`<div class="hero-kpi-delta ${deltaPP(n(T.conv),n(Tp?.conv))>=0?'up':'dn'}">${deltaPP(n(T.conv),n(Tp?.conv))>=0?'↑':'↓'} ${Math.abs(deltaPP(n(T.conv),n(Tp?.conv))).toFixed(1)} п.п.</div>`:''}
       </div>
       <div class="card hero-kpi">
         <div class="hero-kpi-val" data-num="${n(T.avgCheck)}" data-fmt="K">${fmtM(n(T.avgCheck))}</div>
@@ -4960,8 +4981,8 @@ function renderHero(T, Tp, pt, sess, sl, slPct, convCls, lbl, delta){
         <div class="hero-kpi-val bad" data-num="${T.hasLostDetail?n(T.lostConfirmed):n(sl)}">${T.hasLostDetail?fmt(T.lostConfirmed||0):fmt(sl)}</div>
         <div class="hero-kpi-label"><span class="kpi-icon-chip hero-kpi-chip kpi-icon-red"><i class="ti ti-trending-down"></i></span>${T.hasLostDetail?'Проиграно':'Слито'}</div>
         ${T.hasLostDetail
-          ? (T.inProgress>0?`<div class="hero-kpi-delta" style="color:var(--amber-m)" title="Ещё не закрыты ни продажей, ни отказом — не потеря">+${fmt(T.inProgress)} в работе</div>`:`<div class="hero-kpi-delta" style="color:var(--green-m)">всё закрыто</div>`)
-          : `<div class="hero-kpi-delta dn" title="Период без детализации по статусам CRM — грубая оценка">${slPct!==null?slPct.toFixed(0)+'% (оценка)':''}</div>`}
+          ? (T.inProgress>0?`<div class="hero-kpi-note" style="color:var(--amber-m)" title="Ещё не закрыты ни продажей, ни отказом — не потеря. Это НЕ сравнение с прошлым периодом, а срез текущего периода">${fmt(T.inProgress)} ещё в работе</div>`:`<div class="hero-kpi-note" style="color:var(--green-m)">всё закрыто</div>`)
+          : `<div class="hero-kpi-note" title="Период без детализации по статусам CRM — грубая оценка. Это НЕ сравнение с прошлым периодом">${slPct!==null?slPct.toFixed(0)+'% (оценка)':''}</div>`}
       </div>
     </div>
   </div>`;
