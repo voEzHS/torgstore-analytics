@@ -90,13 +90,31 @@ async def compute_and_cache(session_id: str, db: AsyncSession) -> dict:
     conv_ok   = float(settings.get("conv_threshold_ok",   8))
     cache_ver = int(settings.get("cache_version", 1))
 
-    # Period targets
-    pt_result = await db.execute(
-        select(PeriodTarget).where(PeriodTarget.period == sess.period)
-    )
-    pt = pt_result.scalar_one_or_none()
-    plan            = float(pt.plan or 0)            if pt else 0
-    company_revenue = float(pt.company_revenue or 0) if pt else 0
+    # Period targets — план компании (bare period-key) применим ТОЛЬКО для
+    # сессии «Весь отдел» (manager_id == DEPT_MANAGER_ID). Для сессии
+    # конкретного менеджера нужен ЕГО личный план ("mgr:<id>:<период>",
+    # иначе "mgr:<id>:default") — иначе plan_pct в compute_insights() считает
+    # "выручка одного менеджера ÷ план всей компании", что даёт ложные ~0.4%
+    # вместо ~40% в «Зонах роста»/«Сильных сторонах» досье (тот же паттерн
+    # уже верно реализован в team_center._mgr_plan(), продублирован здесь).
+    DEPT_MANAGER_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    if sess.manager_id == DEPT_MANAGER_ID:
+        pt_result = await db.execute(
+            select(PeriodTarget).where(PeriodTarget.period == sess.period)
+        )
+        pt = pt_result.scalar_one_or_none()
+        plan            = float(pt.plan or 0)            if pt else 0
+        company_revenue = float(pt.company_revenue or 0) if pt else 0
+    else:
+        specific_key = f"mgr:{sess.manager_id}:{sess.period}"
+        default_key  = f"mgr:{sess.manager_id}:default"
+        pt_result = await db.execute(
+            select(PeriodTarget.period, PeriodTarget.plan)
+            .where(PeriodTarget.period.in_([specific_key, default_key]))
+        )
+        pt_rows = {p: float(v or 0) for p, v in pt_result.all()}
+        plan = pt_rows.get(specific_key) or pt_rows.get(default_key, 0.0)
+        company_revenue = 0.0  # ручной ввод «общей выручки» существует только для «Весь отдел»
 
     # Overrides словарь
     overrides_itogo  = {}
